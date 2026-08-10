@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Environment
+.env
+
+# Database
+*.db
+*.db-wal
+*.db-shm
+
+# Profile - contains personal data, copy profile.example.json to profile.json
+profile.json
+answer_library.json
+
+# Screenshots
+screenshots/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Playwright
+.playwright/

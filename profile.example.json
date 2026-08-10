@@ -1,0 +1,71 @@
+{
+  "name": "Your Name",
+  "location": {
+    "city": "Stockholm",
+    "country": "Sweden"
+  },
+  "age": 20,
+  "education": "Describe your education background",
+  "work_experience": [
+    {
+      "company": "Company Name",
+      "duration_weeks": 17,
+      "role": "Internship"
+    }
+  ],
+  "interests": [
+    "AI",
+    "software engineering",
+    "robotics",
+    "autonomy",
+    "drones",
+    "computer vision",
+    "hardware",
+    "developer tools",
+    "startups",
+    "growth",
+    "product building",
+    "fintech",
+    "hackathons"
+  ],
+  "hackathon_experience": [
+    "Describe hackathons you've attended"
+  ],
+  "products": [
+    {
+      "name": "Product Name",
+      "description": "What it does",
+      "achievement": "What you achieved with it"
+    }
+  ],
+  "contact": {
+    "email": "you@example.com",
+    "phone": "",
+    "github": "https://github.com/yourusername",
+    "linkedin": "https://linkedin.com/in/yourusername",
+    "website": "",
+    "portfolio": ""
+  },
+  "skills": [],
+  "files": {
+    "cv_path": "assets/cv.pdf",
+    "profile_picture": "assets/profile.jpg"
+  },
+  "travel_preferences": {
+    "requires_travel_support": true,
+    "willing_to_travel": true,
+    "preferred_from": "Stockholm, Sweden"
+  },
+  "consent": {
+    "auto_apply": false,
+    "share_personal_info": false,
+    "request_travel_support": true
+  },
+  "dietary_requirements": "",
+  "nationality": "",
+  "visa": {},
+  "availability": {
+    "weekends": true,
+    "weekdays": false
+  }
+}

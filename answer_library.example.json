@@ -1,0 +1,74 @@
+{
+  "answers": [
+    {
+      "id": "about_me_short",
+      "question_patterns": ["tell us about yourself", "who are you", "introduce yourself", "about you"],
+      "answer": "I'm a builder from Stockholm with a background in robotics and software. I love building things that work in the real world — especially at the intersection of software and hardware. [Customize with your own experience]"
+    },
+    {
+      "id": "what_i_built",
+      "question_patterns": ["what have you built", "projects you're proud of", "describe a project", "tell us about a project"],
+      "answer": "[Describe your proudest project here. Include a specific achievement.]"
+    },
+    {
+      "id": "why_hackathon",
+      "question_patterns": ["why do you want to attend", "why this hackathon", "why are you interested"],
+      "answer": "I want to build something intense and ambitious in a short time with people who take building seriously. [The agent will tailor this per event]"
+    },
+    {
+      "id": "what_will_build",
+      "question_patterns": ["what will you build", "what do you plan to build", "idea for the hackathon"],
+      "answer": "I come to hackathons with a builder's mindset rather than a fixed idea. I want to see what the challenges, tools, and team dynamics inspire. I tend to gravitate toward projects that solve a real problem with a working prototype by the end."
+    },
+    {
+      "id": "why_accept_me",
+      "question_patterns": ["why should we accept you", "why should you be selected", "what makes you a good fit"],
+      "answer": "I show up to build and I ship. [Add specific evidence from your experience]"
+    },
+    {
+      "id": "technologies",
+      "question_patterns": ["what technologies do you use", "tech stack", "languages", "tools"],
+      "answer": "I work across the stack — Python, TypeScript, and whatever tools get the job done. [Customize with your stack]"
+    },
+    {
+      "id": "hackathon_experience_q",
+      "question_patterns": ["hackathon experience", "have you attended hackathons before"],
+      "answer": "[Describe your hackathon experience. Include specific events, projects, and any wins.]"
+    },
+    {
+      "id": "linkedin",
+      "question_patterns": ["linkedin", "linkedin url", "linkedin profile"],
+      "answer": "[Your LinkedIn URL — configure in profile.json]"
+    },
+    {
+      "id": "github",
+      "question_patterns": ["github", "github url", "github profile"],
+      "answer": "[Your GitHub URL — configure in profile.json]"
+    },
+    {
+      "id": "location",
+      "question_patterns": ["where are you based", "where do you live", "location", "city"],
+      "answer": "Stockholm, Sweden"
+    },
+    {
+      "id": "travel_support_needed",
+      "question_patterns": ["do you require travel assistance", "travel support needed", "do you need travel reimbursement"],
+      "answer": "Yes — I would be travelling from Stockholm, Sweden."
+    },
+    {
+      "id": "travel_impact",
+      "question_patterns": ["would travel support impact", "can you attend without travel support"],
+      "answer": "Travel support would significantly affect my ability to attend, as I am based in Stockholm and would need to cover flights and accommodation."
+    },
+    {
+      "id": "team_or_individual",
+      "question_patterns": ["team or individual", "do you have a team", "are you applying as a team"],
+      "answer": "Open to either — I'm happy to join a team at the event or come with one."
+    },
+    {
+      "id": "education",
+      "question_patterns": ["education", "university", "school", "what are you studying"],
+      "answer": "[Describe your education background]"
+    }
+  ]
+}
