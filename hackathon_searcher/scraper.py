@@ -1,390 +1,231 @@
 """
-Hackathon Hub scraper.
+Hackathon Hub scraper — uses Playwright to intercept the Supabase REST API.
 
-Discovers hackathons from hackathonhub.eu using the best available source:
-1. Public API (if discoverable)
-2. Structured page data / embedded JSON
-3. HTML scraping
-4. Browser automation as fallback
+The site is a client-side SPA. Instead of scraping HTML or reverse-engineering
+auth, we intercept the actual API response the page receives from Supabase.
 
-Never attempts to circumvent authentication, CAPTCHAs, or anti-bot protections.
+Discovered events are mapped to our internal schema with all available fields.
 """
 
-import json
 import hashlib
+import json
 import re
 from datetime import datetime, timezone
 from typing import Optional
-from urllib.parse import urljoin, urlparse
-
-import httpx
-from bs4 import BeautifulSoup
+from urllib.parse import urljoin
 
 from hackathon_searcher.database import (
-    make_fingerprint,
-    event_exists_by_fingerprint,
-    get_event_by_fingerprint,
-    insert_event,
-    update_event,
+    make_fingerprint, event_exists_by_fingerprint,
+    get_event_by_fingerprint, insert_event, update_event,
 )
-from hackathon_searcher.models import TravelSupportStatus
 from hackathon_searcher.settings import settings
 
-
+SUPABASE_URL = "https://czcrgiykicowicoufthv.supabase.co"
 HACKATHON_HUB_URL = settings.HACKATHON_HUB_URL
-USER_AGENT = "HackathonSearcher/0.1 (+https://github.com; personal agent)"
-
-
-def _make_client() -> httpx.Client:
-    return httpx.Client(
-        headers={"User-Agent": USER_AGENT},
-        timeout=30,
-        follow_redirects=True,
-    )
-
-
-# --- Event extraction from HTML ---
-
-def _extract_embedded_json(html: str) -> Optional[dict]:
-    """Try to find embedded JSON data in script tags (Next.js __NEXT_DATA__, etc.)."""
-    soup = BeautifulSoup(html, "lxml")
-
-    # Next.js __NEXT_DATA__
-    next_data = soup.find("script", id="__NEXT_DATA__")
-    if next_data and next_data.string:
-        try:
-            data = json.loads(next_data.string)
-            return data
-        except json.JSONDecodeError:
-            pass
-
-    # Generic JSON-LD
-    for script in soup.find_all("script", type="application/ld+json"):
-        if script.string:
-            try:
-                return json.loads(script.string)
-            except json.JSONDecodeError:
-                pass
-
-    # Look for window.__INITIAL_STATE__ or similar
-    for script in soup.find_all("script"):
-        if script.string:
-            for pattern in [
-                r"window\.__INITIAL_STATE__\s*=\s*({.*?});",
-                r"window\.__DATA__\s*=\s*({.*?});",
-                r"window\.__PRELOADED_STATE__\s*=\s*({.*?});",
-            ]:
-                match = re.search(pattern, script.string, re.DOTALL)
-                if match:
-                    try:
-                        return json.loads(match.group(1))
-                    except json.JSONDecodeError:
-                        pass
-
-    return None
-
-
-def _extract_events_from_html(html: str, base_url: str) -> list[dict]:
-    """Extract events from HTML using known patterns."""
-    soup = BeautifulSoup(html, "lxml")
-    events = []
-
-    # Common patterns for event/hackathon cards
-    card_selectors = [
-        ".event-card", ".hackathon-card", '[class*="event"]', '[class*="hackathon"]',
-        "article", ".card", '[class*="Card"]',
-        "a[href*='/events/']", "a[href*='/hackathon/']",
-    ]
-
-    seen_urls = set()
-
-    for selector in card_selectors:
-        for card in soup.select(selector):
-            # If it's an <a> tag, use it directly
-            if card.name == "a":
-                event_url = urljoin(base_url, card.get("href", ""))
-                if event_url in seen_urls:
-                    continue
-                seen_urls.add(event_url)
-
-                name_el = card.find(["h2", "h3", "h4", "span"], class_=re.compile(r"title|name", re.I))
-                event_name = name_el.get_text(strip=True) if name_el else card.get_text(strip=True)
-
-                events.append({
-                    "event_name": event_name[:200],
-                    "hackathonhub_url": event_url,
-                    "source_element": "link_card",
-                })
-                continue
-
-            # Otherwise, find links inside the card
-            link = card.find("a", href=re.compile(r"/events?/|/hackathon"))
-            if not link:
-                continue
-            event_url = urljoin(base_url, link.get("href", ""))
-            if event_url in seen_urls:
-                continue
-            seen_urls.add(event_url)
-
-            name_el = card.find(["h2", "h3", "h4", "span"], class_=re.compile(r"title|name", re.I))
-            event_name = name_el.get_text(strip=True) if name_el else card.get_text(strip=True)
-
-            # Try to extract date/location
-            date_el = card.find(["time", "span"], class_=re.compile(r"date", re.I))
-            location_el = card.find(["span", "div"], class_=re.compile(r"location|city|place", re.I))
-
-            events.append({
-                "event_name": event_name[:200],
-                "hackathonhub_url": event_url,
-                "city": location_el.get_text(strip=True) if location_el else "",
-                "start_date": date_el.get_text(strip=True) if date_el else "",
-                "source_element": "card",
-            })
-
-    return events
-
-
-def _extract_event_details_from_page(html: str, url: str) -> dict:
-    """Extract detailed event information from an individual event page."""
-    soup = BeautifulSoup(html, "lxml")
-    details: dict = {}
-
-    # Title
-    title_el = soup.find(["h1", "h2"], class_=re.compile(r"title|heading", re.I))
-    if not title_el:
-        title_el = soup.find("title")
-    details["event_name"] = title_el.get_text(strip=True) if title_el else ""
-
-    # Description - look for main content
-    for selector in ["main p", "article p", ".description p", ".content p", '[class*="description"]']:
-        desc_el = soup.select_one(selector)
-        if desc_el:
-            details["description"] = desc_el.get_text(strip=True)[:2000]
-            break
-
-    # External link
-    ext_link = soup.find("a", href=re.compile(r"https?://"), string=re.compile(r"website|register|apply|visit", re.I))
-    if not ext_link:
-        ext_link = soup.find("a", class_=re.compile(r"external|website|link|button", re.I))
-    if ext_link:
-        href = ext_link.get("href", "")
-        if urlparse(href).netloc not in ("hackathonhub.eu", "www.hackathonhub.eu", ""):
-            details["event_url"] = href
-
-    # Dates
-    for time_el in soup.find_all("time"):
-        datetime_attr = time_el.get("datetime", "")
-        if datetime_attr:
-            details.setdefault("start_date", datetime_attr)
-
-    # Location
-    location_el = soup.find(["span", "div"], class_=re.compile(r"location|city|venue", re.I))
-    if location_el:
-        location_text = location_el.get_text(strip=True)
-        # Try to parse city, country
-        parts = [p.strip() for p in location_text.split(",")]
-        if len(parts) >= 1:
-            details["city"] = parts[0]
-        if len(parts) >= 2:
-            details["country"] = parts[-1]
-
-    details["hackathonhub_url"] = url
-    return details
-
-
-# --- Main scraping functions ---
-
-def fetch_hackathon_hub() -> str:
-    """Fetch the Hackathon Hub main page."""
-    client = _make_client()
-    try:
-        resp = client.get(HACKATHON_HUB_URL)
-        resp.raise_for_status()
-        return resp.text
-    finally:
-        client.close()
-
-
-def fetch_event_page(url: str) -> Optional[str]:
-    """Fetch an individual event page."""
-    client = _make_client()
-    try:
-        resp = client.get(url)
-        resp.raise_for_status()
-        return resp.text
-    finally:
-        client.close()
 
 
 def discover_events() -> list[dict]:
     """
     Main discovery function.
 
-    Returns a list of raw event dicts discovered from Hackathon Hub.
-    Each dict has at minimum: event_name, hackathonhub_url.
+    Opens Hackathon Hub in Playwright, waits for the Supabase API call
+    to complete, intercepts the JSON response, and maps to our event schema.
+
+    Returns a list of raw event dicts.
     """
-    print(f"[scraper] Fetching {HACKATHON_HUB_URL}...")
+    print(f"[scraper] Discovering events from {HACKATHON_HUB_URL}...")
+
     try:
-        html = fetch_hackathon_hub()
-    except Exception as e:
-        print(f"[scraper] Failed to fetch Hackathon Hub: {e}")
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("[scraper] Playwright not available, cannot discover events")
         return []
 
-    # Try embedded JSON first
-    embedded = _extract_embedded_json(html)
-    if embedded:
-        print("[scraper] Found embedded JSON data")
-        # Try to extract events from common Next.js page props structures
-        events = _extract_events_from_json(embedded)
-        if events:
-            print(f"[scraper] Extracted {len(events)} events from embedded JSON")
-            return events
+    raw_events = []
+    api_data = {}
 
-    # Fall back to HTML extraction
-    print("[scraper] Falling back to HTML extraction")
-    events = _extract_events_from_html(html, HACKATHON_HUB_URL)
-    print(f"[scraper] Extracted {len(events)} events from HTML")
-    return events
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+
+            def handle_response(response):
+                nonlocal api_data
+                url = response.url
+                if 'supabase.co/rest/v1/events_public' in url and response.status == 200:
+                    try:
+                        api_data = response.json()
+                    except Exception:
+                        pass
+
+            page.on('response', handle_response)
+            page.goto(f"{HACKATHON_HUB_URL.rstrip('/')}/events", wait_until="networkidle", timeout=30000)
+            # Wait a bit more for data to load
+            page.wait_for_timeout(2000)
+            browser.close()
+
+    except Exception as e:
+        print(f"[scraper] Playwright discovery failed: {e}")
+        return []
+
+    if isinstance(api_data, list):
+        print(f"[scraper] Intercepted {len(api_data)} events from Supabase API")
+        for item in api_data:
+            event = _map_api_event(item)
+            if event:
+                raw_events.append(event)
+    elif isinstance(api_data, dict):
+        # Might have the data nested
+        items = api_data.get('data') or api_data.get('items') or api_data.get('events') or []
+        if isinstance(items, list):
+            print(f"[scraper] Extracted {len(items)} events from nested API response")
+            for item in items:
+                event = _map_api_event(item)
+                if event:
+                    raw_events.append(event)
+        else:
+            print(f"[scraper] Unexpected API response format: {list(api_data.keys())[:5]}")
+    else:
+        print(f"[scraper] No events found in API response")
+
+    return raw_events
 
 
-def _extract_events_from_json(data: dict) -> list[dict]:
-    """Extract events from embedded JSON data (handles common patterns)."""
-    events = []
-
-    def _search(obj, depth=0):
-        if depth > 10:
-            return
-        if isinstance(obj, dict):
-            # Common keys that might contain event lists
-            for key in ["events", "hackathons", "items", "data", "results", "listings", "posts"]:
-                if key in obj and isinstance(obj[key], list):
-                    for item in obj[key]:
-                        if isinstance(item, dict):
-                            event = _parse_json_event(item)
-                            if event:
-                                events.append(event)
-            for v in obj.values():
-                _search(v, depth + 1)
-        elif isinstance(obj, list):
-            for item in obj:
-                _search(item, depth + 1)
-
-    _search(data)
-    return events
-
-
-def _parse_json_event(item: dict) -> Optional[dict]:
-    """Parse a single event from JSON data."""
-    name = (
-        item.get("title") or item.get("name") or item.get("event_name")
-        or item.get("Title") or item.get("Name") or ""
-    )
-    if not name:
+def _map_api_event(item: dict) -> Optional[dict]:
+    """Map a Supabase API event to our internal schema."""
+    event_id_raw = item.get("id", "")
+    title = item.get("title_en") or item.get("title") or ""
+    if not title:
         return None
 
-    url = (
-        item.get("url") or item.get("link") or item.get("href")
-        or item.get("slug") or ""
-    )
-    if url and not url.startswith("http"):
-        url = urljoin(HACKATHON_HUB_URL, url)
+    # Determine travel support status
+    travel_support_status = "NO_TRAVEL_INFORMATION"
+    travel_support_confidence = 0.0
 
-    return {
-        "event_name": str(name)[:200],
-        "hackathonhub_url": str(url) if url else "",
-        "organizer": str(item.get("organizer", item.get("organizer_name", ""))),
-        "city": str(item.get("city", item.get("location", ""))),
-        "country": str(item.get("country", "")),
-        "start_date": str(item.get("start_date", item.get("date", item.get("startDate", "")))),
-        "end_date": str(item.get("end_date", item.get("endDate", ""))),
-        "description": str(item.get("description", item.get("summary", "")))[:2000],
-        "physical_or_online": str(item.get("type", item.get("format", "unknown"))),
-        "source": "json",
+    if item.get("travel_costs_covered"):
+        travel_support_status = "CONFIRMED_TRAVEL_REIMBURSEMENT"
+        travel_support_confidence = 0.85
+    elif item.get("accommodation_costs_covered"):
+        travel_support_status = "CONFIRMED_ACCOMMODATION_ONLY"
+        travel_support_confidence = 0.85
+    elif item.get("accommodation_provided"):
+        travel_support_status = "CONFIRMED_ACCOMMODATION_ONLY"
+        travel_support_confidence = 0.80
+
+    # Build travel support details
+    travel_details = {
+        "source": "hackathonhub_api",
+        "travel_costs_covered": item.get("travel_costs_covered", False),
+        "accommodation_provided": item.get("accommodation_provided", False),
+        "accommodation_costs_covered": item.get("accommodation_costs_covered", False),
+        "meals_included": item.get("meals_included", False),
     }
 
+    # Location
+    city = item.get("city") or ""
+    country = item.get("country") or ""
+    location_type = item.get("location_type", "")
 
-def scrape_event_details(event: dict) -> dict:
-    """Scrape detailed information from an individual event page."""
-    url = event.get("hackathonhub_url", "")
-    if not url:
-        return event
+    # Physical/online
+    physical_or_online = "unknown"
+    if location_type == "in-person":
+        physical_or_online = "physical"
+    elif location_type == "online":
+        physical_or_online = "online"
+    elif location_type == "hybrid":
+        physical_or_online = "hybrid"
 
-    print(f"[scraper] Fetching event page: {url}")
-    try:
-        html = fetch_event_page(url)
-    except Exception as e:
-        print(f"[scraper] Failed to fetch event page {url}: {e}")
-        return event
+    # Build event URL and external URL
+    event_slug = item.get("url") or ""
+    hackathonhub_url = f"{HACKATHON_HUB_URL.rstrip('/')}/events/{event_slug}" if event_slug else ""
 
-    if not html:
-        return event
+    # Extract external URL from hackathonhub URL slug if it contains an external URL
+    external_url = ""
+    if event_slug and event_slug.startswith("http"):
+        external_url = event_slug
+    elif event_slug and "/events/http" in hackathonhub_url:
+        idx = hackathonhub_url.index("/events/") + 8
+        external_url = hackathonhub_url[idx:]
 
-    details = _extract_event_details_from_page(html, url)
-    # Merge: don't overwrite existing values with empty ones
-    for k, v in details.items():
-        if v and not event.get(k):
-            event[k] = v
+    # Parse tags as themes
+    tags = item.get("tags", [])
+    if isinstance(tags, str):
+        try:
+            tags = json.loads(tags)
+        except (json.JSONDecodeError, TypeError):
+            tags = []
 
-    # Also try embedded JSON on the detail page
-    embedded = _extract_embedded_json(html)
-    if embedded:
-        json_events = _extract_events_from_json(embedded)
-        if json_events:
-            for k, v in json_events[0].items():
-                if v and not event.get(k):
-                    event[k] = v
+    # Participants
+    participant_limit = ""
+    expected = item.get("expected_participants")
+    max_team = item.get("max_team_size")
+    if expected and max_team:
+        participant_limit = f"~{expected} participants, max team {max_team}"
+    elif expected:
+        participant_limit = f"~{expected} participants"
+
+    event = {
+        "event_id": f"evt_{event_id_raw[:16]}" if event_id_raw else f"evt_{hashlib.md5(title.encode()).hexdigest()[:16]}",
+        "event_name": title,
+        "organizer": item.get("organizer_name", ""),
+        "hackathonhub_url": hackathonhub_url,
+        "event_url": external_url,
+        "application_url": "",  # Will be filled by research
+        "city": city,
+        "country": country,
+        "venue": "",
+        "physical_or_online": physical_or_online,
+        "start_date": item.get("start_date", "")[:10] if item.get("start_date") else "",
+        "end_date": item.get("end_date", "")[:10] if item.get("end_date") else "",
+        "application_deadline": item.get("application_deadline", "")[:10] if item.get("application_deadline") else "",
+        "description": (item.get("description_en") or item.get("description") or "")[:2000],
+        "themes": json.dumps(tags) if isinstance(tags, list) else "[]",
+        "sponsors": "[]",
+        "judges": "[]",
+        "partners": "[]",
+        "prizes": item.get("prize_money", "") or "",
+        "participant_limit": participant_limit,
+        "travel_support": travel_support_status,
+        "travel_support_type": travel_support_status,
+        "travel_support_confidence": travel_support_confidence,
+        "travel_support_source": "hackathonhub_api",
+        "travel_support_details": json.dumps(travel_details),
+        "flight_credits": "Yes" if item.get("travel_costs_covered") else "",
+        "accommodation": "Yes" if item.get("accommodation_provided") else "",
+        "food": "Yes" if item.get("meals_included") else "",
+        "extra_data": json.dumps({
+            "api_id": event_id_raw,
+            "level": item.get("level", ""),
+            "language": item.get("language", ""),
+            "price_min": item.get("price_min"),
+            "price_max": item.get("price_max"),
+            "registration_status": item.get("registration_status", ""),
+            "status": item.get("status", ""),
+            "beginner_friendly": item.get("beginner_friendly", False),
+            "team_formation_supported": item.get("team_formation_supported", False),
+            "on_site_hardware_provided": item.get("on_site_hardware_provided", False),
+            "mentoring_available": item.get("mentoring_available", False),
+            "reference_number": item.get("reference_number", ""),
+            "share_sentence_en": item.get("share_sentence_en", ""),
+        }),
+    }
 
     return event
-
-
-def classify_event(event: dict) -> str:
-    """
-    Classify an event against the database.
-
-    Returns: 'NEW', 'UPDATED', 'KNOWN', or 'CLOSED'
-    """
-    fingerprint = make_fingerprint(
-        event.get("event_name", ""),
-        event.get("start_date", ""),
-        event.get("organizer", ""),
-        event.get("city", "")
-    )
-
-    existing = get_event_by_fingerprint(fingerprint)
-    if not existing:
-        return "NEW"
-
-    # Check if relevant fields changed
-    check_fields = [
-        "event_url", "application_url", "application_deadline",
-        "description", "sponsors", "themes"
-    ]
-    for field in check_fields:
-        old_val = str(existing.get(field, "")).strip()
-        new_val = str(event.get(field, "")).strip()
-        if old_val != new_val and new_val:
-            return "UPDATED"
-
-    return "KNOWN"
 
 
 def process_discovered_events(raw_events: list[dict]) -> tuple[list[str], list[str], int]:
     """
     Process discovered events: classify, store new/updated, skip known.
-
     Returns: (new_ids, updated_ids, skipped_count)
     """
     new_ids = []
     updated_ids = []
 
     for event in raw_events:
-        classification = classify_event(event)
+        classification = _classify_event(event)
 
         if classification == "KNOWN":
             continue
-
-        # For new/updated, scrape the detail page for more info
-        event = scrape_event_details(event)
 
         fingerprint = make_fingerprint(
             event.get("event_name", ""),
@@ -392,12 +233,9 @@ def process_discovered_events(raw_events: list[dict]) -> tuple[list[str], list[s
             event.get("organizer", ""),
             event.get("city", "")
         )
-
         event["fingerprint"] = fingerprint
 
         if classification == "NEW":
-            event["event_id"] = f"evt_{fingerprint[:16]}"
-            event["status"] = "DISCOVERED"
             try:
                 insert_event(event)
                 new_ids.append(event["event_id"])
@@ -409,7 +247,8 @@ def process_discovered_events(raw_events: list[dict]) -> tuple[list[str], list[s
             if existing:
                 updates = {}
                 for field in ["event_url", "application_url", "application_deadline",
-                              "description", "sponsors", "themes"]:
+                              "description", "sponsors", "themes", "travel_support",
+                              "travel_support_type", "travel_support_confidence"]:
                     new_val = event.get(field, "")
                     if new_val and str(new_val) != str(existing.get(field, "")):
                         updates[field] = new_val
@@ -422,3 +261,29 @@ def process_discovered_events(raw_events: list[dict]) -> tuple[list[str], list[s
 
     skipped = len(raw_events) - len(new_ids) - len(updated_ids)
     return new_ids, updated_ids, skipped
+
+
+def _classify_event(event: dict) -> str:
+    """Classify an event against the database: NEW, UPDATED, KNOWN."""
+    fingerprint = make_fingerprint(
+        event.get("event_name", ""),
+        event.get("start_date", ""),
+        event.get("organizer", ""),
+        event.get("city", "")
+    )
+
+    existing = get_event_by_fingerprint(fingerprint)
+    if not existing:
+        return "NEW"
+
+    check_fields = [
+        "event_url", "application_url", "application_deadline",
+        "description", "sponsors", "themes", "travel_support"
+    ]
+    for field in check_fields:
+        old_val = str(existing.get(field, "")).strip()
+        new_val = str(event.get(field, "")).strip()
+        if old_val != new_val and new_val:
+            return "UPDATED"
+
+    return "KNOWN"

@@ -7,39 +7,75 @@ Loaded from environment variables with sensible defaults.
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
+
+# Load .env file if it exists
+_env_path = Path(__file__).parent.parent / ".env"
+if _env_path.exists():
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(_env_path)
+    except ImportError:
+        pass
 
 
 @dataclass
 class Settings:
     # --- Application behavior ---
-    AUTO_APPLY: bool = os.getenv("AUTO_APPLY", "true").lower() == "true"
+    AUTO_APPLY: bool = os.getenv("AUTO_APPLY", "false").lower() == "true"
     DRY_RUN: bool = os.getenv("DRY_RUN", "true").lower() == "true"
     MIN_APPLICATION_SCORE: int = int(os.getenv("MIN_APPLICATION_SCORE", "55"))
     AUTO_APPLY_FLIGHT_SUPPORT: bool = os.getenv("AUTO_APPLY_FLIGHT_SUPPORT", "true").lower() == "true"
+    TEAM_APPLICANT_IDS: tuple[str, ...] = tuple(
+        applicant_id.strip() for applicant_id in os.getenv("TEAM_APPLICANT_IDS", "builder,teammate").split(",")
+        if applicant_id.strip()
+    )
+    TEAM_CONFIG_PATH: str = os.getenv("TEAM_CONFIG_PATH", "team.json")
+    TEAM_MIN_APPLY_SCORE: float = float(os.getenv("TEAM_MIN_APPLY_SCORE", "55"))
+
+    # --- Live test mode ---
+    LIVE_TEST_MODE: bool = os.getenv("LIVE_TEST_MODE", "false").lower() == "true"
+    MAX_LIVE_APPLICATIONS_PER_RUN: int = int(os.getenv("MAX_LIVE_APPLICATIONS_PER_RUN", "3"))
+    LIVE_MIN_EVENT_SCORE: int = int(os.getenv("LIVE_MIN_EVENT_SCORE", "60"))
+    LIVE_MIN_APPLY_SCORE: int = int(os.getenv("LIVE_MIN_APPLY_SCORE", "60"))
+    LIVE_REQUIRE_CONFIRMED_TRAVEL: bool = os.getenv("LIVE_REQUIRE_CONFIRMED_TRAVEL", "false").lower() == "true"
+    STOP_AFTER_FIRST_SUCCESS: bool = os.getenv("STOP_AFTER_FIRST_SUCCESS", "false").lower() == "true"
+
+    # --- Deterministic consent policies ---
+    ACCEPT_REQUIRED_EVENT_RULES: bool = os.getenv("ACCEPT_REQUIRED_EVENT_RULES", "true").lower() == "true"
+    ACCEPT_REQUIRED_DATA_PROCESSING: bool = os.getenv("ACCEPT_REQUIRED_DATA_PROCESSING", "true").lower() == "true"
+    ACCEPT_OPTIONAL_NEWSLETTER: bool = os.getenv("ACCEPT_OPTIONAL_NEWSLETTER", "false").lower() == "true"
+    ACCEPT_OPTIONAL_MARKETING: bool = os.getenv("ACCEPT_OPTIONAL_MARKETING", "false").lower() == "true"
+    ACCEPT_OPTIONAL_TALENT_POOL: bool = os.getenv("ACCEPT_OPTIONAL_TALENT_POOL", "false").lower() == "true"
+    ACCEPT_OPTIONAL_MEDIA: bool = os.getenv("ACCEPT_OPTIONAL_MEDIA", "false").lower() == "true"
 
     # --- Discovery ---
     HACKATHON_HUB_URL: str = os.getenv("HACKATHON_HUB_URL", "https://hackathonhub.eu/")
     CRAWL_INTERVAL_HOURS: int = int(os.getenv("CRAWL_INTERVAL_HOURS", "24"))
 
     # --- Geography ---
-    HOME_CITY: str = os.getenv("HOME_CITY", "Stockholm")
-    HOME_COUNTRY: str = os.getenv("HOME_COUNTRY", "Sweden")
+    # Legacy global values; runtime location preferences are profile-specific.
+    HOME_CITY: str = os.getenv("HOME_CITY", "")
+    HOME_COUNTRY: str = os.getenv("HOME_COUNTRY", "")
     PREFER_PHYSICAL_EVENTS: bool = os.getenv("PREFER_PHYSICAL_EVENTS", "true").lower() == "true"
     PREFERRED_REGIONS: list[str] = field(default_factory=lambda: ["Europe"])
 
     # --- Profile ---
-    PROFILE_PATH: str = os.getenv("PROFILE_PATH", "profile.json")
-    ANSWER_LIBRARY_PATH: str = os.getenv("ANSWER_LIBRARY_PATH", "answer_library.json")
-
+    PROFILES_DIR: str = os.getenv("PROFILES_DIR", "profiles")
+    ANSWER_LIBRARY_DIR: str = os.getenv("ANSWER_LIBRARY_DIR", "answer_library")
     # --- Database ---
     DATABASE_PATH: str = os.getenv("DATABASE_PATH", "hackathon_searcher.db")
 
     # --- Browser ---
     HEADLESS: bool = os.getenv("HEADLESS", "true").lower() == "true"
     BROWSER_TIMEOUT_MS: int = int(os.getenv("BROWSER_TIMEOUT_MS", "30000"))
+    BROWSER_PROFILES_DIR: str = os.getenv("BROWSER_PROFILES_DIR", "browser_profiles")
 
     # --- LLM ---
     LLM_MODEL: str = os.getenv("LLM_MODEL", "")
+    LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "openai").lower()
+    LLM_API_KEY: str = os.getenv("LLM_API_KEY", "")
+    LLM_BASE_URL: str = os.getenv("LLM_BASE_URL", "")
 
     # --- Notification ---
     NOTIFY_HIGH_SCORE_THRESHOLD: int = int(os.getenv("NOTIFY_HIGH_SCORE_THRESHOLD", "80"))

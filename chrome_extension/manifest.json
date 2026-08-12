@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "Hackathon Searcher Autofill",
+  "version": "1.2.2",
+  "description": "Locally autofills prepared Luma applications; never submits them.",
+  "permissions": ["storage"],
+  "host_permissions": ["https://luma.com/*", "https://*.luma.com/*", "https://lu.ma/*", "https://*.lu.ma/*", "http://127.0.0.1:8765/*"],
+  "background": {"service_worker": "background.js"},
+  "content_scripts": [{"matches": ["https://luma.com/*", "https://*.luma.com/*", "https://lu.ma/*", "https://*.lu.ma/*"], "js": ["content.js"], "run_at": "document_idle"}],
+  "action": {"default_title": "Hackathon Searcher", "default_popup": "popup.html"}
+}
