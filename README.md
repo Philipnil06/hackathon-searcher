@@ -16,7 +16,7 @@ Try it safely in about five minutes: the setup wizard creates local profiles and
 - Scores opportunities per applicant and makes a team-first decision from the average score.
 - Requires every team member to pass hard eligibility and safety gates before an application is prepared.
 - Generates answers only from the profile facts you provide, then checks factual and cross-profile consistency.
-- Tracks duplicate protection, reports, confirmations, and submission snapshots in a local SQLite database.
+- Stores duplicate-protection state, confirmations, and submission snapshots in a local SQLite database.
 - Uses autonomous provider flows only where technically supported. Luma is human-assisted: the extension fills the form; you review and make the final irreversible submission.
 
 ## Quick Start
@@ -66,7 +66,7 @@ python -m hackathon_searcher.cli daily --dry-run
 4. **Gate safely:** every member must independently pass eligibility, schedule, form, factual, cross-profile, consent, and duplicate checks.
 5. **Prepare applications:** answers are tailored using verified local profile facts.
 6. **Apply or assist:** supported providers use guarded automation. For Luma, the user completes the final action in Chrome.
-7. **Track locally:** application state, confirmations, reports, and snapshots are retained locally.
+7. **Track locally:** application state, confirmations, and snapshots are retained locally.
 
 A high score never overrides a hard blocker, including ineligibility, schedule conflicts, closed forms, unknown required fields, CAPTCHA, required unsupported login, factual conflicts, cross-profile conflicts, or an existing duplicate.
 
@@ -183,10 +183,12 @@ llm verify                    Check provider settings without an API request
 browser setup|verify|open      Manage the isolated Chrome profile
 schedule setup|status|remove   Manage the Windows background task
 human-assist                  List/open/confirm prepared Luma applications
-dashboard | events | report   Inspect local results
+dashboard | events | report   Print local summaries in the terminal
 ```
 
 Run `python -m hackathon_searcher.cli --help` for the built-in overview.
+
+There is currently **no web dashboard and no searchable dashboard interface**. The `dashboard`, `events`, and `report` commands are terminal views over local data; use them as inspection tools rather than as a hosted UI. A `daily` run may also write a plain local text report when it completes.
 
 ## Troubleshooting
 
