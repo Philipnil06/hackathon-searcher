@@ -1,0 +1,5 @@
+{
+  "team_id": "default",
+  "members": ["builder", "teammate"],
+  "minimum_team_score": 55
+}

@@ -1,36 +1,61 @@
-# Python
+# Python and tooling
 __pycache__/
 *.py[cod]
 *.egg-info/
-dist/
 build/
+dist/
 .venv/
 venv/
+.pytest_cache/
+.mypy_cache/
+.coverage
 
-# Environment
+# Local environment and logs
 .env
+.env.*
+!.env.example
+*.log
+logs/
+*.tmp
+tmp/
 
-# Database
+# Local databases and runtime state
 *.db
 *.db-wal
 *.db-shm
+*.sqlite
+*.sqlite3
+reports/
+submission_snapshots/
+human_assist/
+browser_profiles/
+browser_data/
+auth/
+.playwright/
+ChromeGuest/
+runtime/
+*.lock
 
-# Profile - contains personal data, copy profile.example.json to profile.json
+# Private applicant data; only fictional templates are public.
+profiles/*.json
+!profiles/example_*.json
+answer_library/*.json
+!answer_library/example_*.json
 profile.json
 answer_library.json
+team.json
 
-# Screenshots
-screenshots/
-
-# IDE
-.vscode/
+# Local editor and operating-system state
 .idea/
+.vscode/
 *.swp
 *.swo
-
-# OS
 .DS_Store
 Thumbs.db
 
-# Playwright
-.playwright/
+# Captured browser/download artifacts
+screenshots/
+downloads/
+*.png
+*.jpg
+*.jpeg

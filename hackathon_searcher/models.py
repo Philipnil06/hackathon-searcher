@@ -103,6 +103,7 @@ class FormField(BaseModel):
     answer_confidence: float = 0.0
     answer_source: str = ""  # profile, answer_library, generated, manual, unknown
     page_number: int = 0
+    selector: str = ""
 
 
 class FormSnapshot(BaseModel):
@@ -115,6 +116,23 @@ class FormSnapshot(BaseModel):
     score: float = 0.0
     reason_for_applying: str = ""
     travel_support_status: str = ""
+
+
+class EventPageAnalysis(BaseModel):
+    """Structured output from LLM event page analysis."""
+    travel_support_status: str = "NO_TRAVEL_INFORMATION"
+    travel_support_details: str = ""
+    travel_support_amount: str = ""
+    travel_support_currency: str = ""
+    travel_support_conditions: str = ""
+    sponsors: list[str] = Field(default_factory=list)
+    themes: list[str] = Field(default_factory=list)
+    is_physical: bool = True
+    application_deadline: str = ""
+    eligibility_requirements: str = ""
+    prizes_description: str = ""
+    confidence: float = 0.0
+    source_evidence: str = ""
 
 
 class DailyReport(BaseModel):

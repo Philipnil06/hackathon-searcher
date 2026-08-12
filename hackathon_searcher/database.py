@@ -1,13 +1,14 @@
 """
-Database layer for Hackathon Searcher.
+Database layer for Hackathon Searcher — multi-applicant edition.
 
-Uses SQLite for persistence. Stores events, applications, and audit logs.
-All operations are idempotent where possible.
+Uses SQLite. Tracks events, per-applicant applications, application groups, and audit logs.
+UNIQUE(event_id, applicant_id) prevents duplicate applications.
 """
 
 import json
-import sqlite3
 import hashlib
+import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -32,7 +33,6 @@ CREATE TABLE IF NOT EXISTS events (
     end_date TEXT DEFAULT '',
     application_deadline TEXT DEFAULT '',
     application_open INTEGER DEFAULT 1,
-    application_status TEXT DEFAULT '',
     description TEXT DEFAULT '',
     themes TEXT DEFAULT '[]',
     sponsors TEXT DEFAULT '[]',
@@ -43,17 +43,31 @@ CREATE TABLE IF NOT EXISTS events (
     age_requirement TEXT DEFAULT '',
     student_requirement TEXT DEFAULT '',
     nationality_requirement TEXT DEFAULT '',
+    eligibility_rules_raw TEXT DEFAULT '',
     travel_support TEXT DEFAULT 'UNKNOWN',
     travel_support_type TEXT DEFAULT '',
     travel_support_amount TEXT DEFAULT '',
     travel_support_currency TEXT DEFAULT '',
     travel_support_confidence REAL DEFAULT 0.0,
+    travel_support_probability REAL DEFAULT 0.0,
     travel_support_source TEXT DEFAULT '',
+    hub_travel_status TEXT DEFAULT '',
+    official_travel_status TEXT DEFAULT '',
+    final_travel_status TEXT DEFAULT '',
+    application_open_date TEXT DEFAULT '',
+    last_application_check TEXT DEFAULT '',
+    next_application_check TEXT DEFAULT '',
     travel_support_details TEXT DEFAULT '{}',
     flight_credits TEXT DEFAULT '',
     accommodation TEXT DEFAULT '',
     food TEXT DEFAULT '',
-    score REAL DEFAULT 0.0,
+    event_score REAL DEFAULT 0.0,
+    team_status TEXT DEFAULT '',
+    team_member_scores TEXT DEFAULT '{}',
+    team_apply_score REAL DEFAULT 0.0,
+    team_member_travel_eligibility TEXT DEFAULT '{}',
+    team_travel_status TEXT DEFAULT '',
+    team_application_group_id TEXT DEFAULT '',
     score_reasoning TEXT DEFAULT '',
     confidence REAL DEFAULT 0.0,
     notes TEXT DEFAULT '',
@@ -65,28 +79,76 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE TABLE IF NOT EXISTS applications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    application_id TEXT UNIQUE NOT NULL,
     event_id TEXT NOT NULL,
-    event_name TEXT NOT NULL,
+    applicant_id TEXT NOT NULL,
+    applicant_name TEXT NOT NULL,
     application_url TEXT DEFAULT '',
+    application_group_id TEXT DEFAULT '',
     questions TEXT DEFAULT '[]',
     answers TEXT DEFAULT '[]',
-    date_applied TEXT DEFAULT '',
+    date_started TEXT DEFAULT '',
+    date_submitted TEXT DEFAULT '',
     application_confirmation TEXT DEFAULT '',
     application_reference TEXT DEFAULT '',
     submission_snapshot TEXT DEFAULT '{}',
-    status TEXT DEFAULT 'READY_TO_APPLY',
-    score REAL DEFAULT 0.0,
+    status TEXT DEFAULT 'DISCOVERED',
+    event_score REAL DEFAULT 0.0,
+    applicant_fit_score REAL DEFAULT 0.0,
+    travel_score REAL DEFAULT 0.0,
+    apply_score REAL DEFAULT 0.0,
+    eligibility_status TEXT DEFAULT '',
+    eligibility_reasoning TEXT DEFAULT '',
+    travel_eligible INTEGER DEFAULT 0,
+    travel_support_requested INTEGER DEFAULT 0,
     score_reasoning TEXT DEFAULT '',
     travel_support_status TEXT DEFAULT '',
+    form_provider TEXT DEFAULT '',
+    application_discovery_source TEXT DEFAULT '',
+    application_discovery_confidence REAL DEFAULT 0.0,
+    application_discovery_reason TEXT DEFAULT '',
+    application_discovery_path TEXT DEFAULT '[]',
+    discovery_status TEXT DEFAULT '',
+    application_open_date TEXT DEFAULT '',
+    last_application_check TEXT DEFAULT '',
+    next_application_check TEXT DEFAULT '',
+    auth_status TEXT DEFAULT '',
+    auth_platform TEXT DEFAULT '',
+    auth_login_url TEXT DEFAULT '',
+    auth_account TEXT DEFAULT '',
+    source_pages_checked TEXT DEFAULT '[]',
+    form_metadata TEXT DEFAULT '{}',
+    form_fillable INTEGER DEFAULT 0,
+    application_open INTEGER DEFAULT 0,
+    fact_check_passed INTEGER DEFAULT 0,
+    cross_profile_check_passed INTEGER DEFAULT 0,
+    duplicate_check_passed INTEGER DEFAULT 0,
+    consent_policy_passed INTEGER DEFAULT 0,
+    unreadable_required_fields INTEGER DEFAULT 0,
+    form_validation_status TEXT DEFAULT '',
+    form_validated_at TEXT DEFAULT '',
+    eligibility_confidence REAL DEFAULT 0.0,
+    eligibility_source_evidence TEXT DEFAULT '',
+    eligibility_requirements TEXT DEFAULT '[]',
     notes TEXT DEFAULT '',
     FOREIGN KEY (event_id) REFERENCES events(event_id),
-    UNIQUE(event_id)
+    UNIQUE(event_id, applicant_id)
+);
+
+CREATE TABLE IF NOT EXISTS application_groups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id TEXT UNIQUE NOT NULL,
+    event_id TEXT NOT NULL,
+    applicant_ids TEXT DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (event_id) REFERENCES events(event_id)
 );
 
 CREATE TABLE IF NOT EXISTS audit_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp TEXT NOT NULL,
     event_id TEXT DEFAULT '',
+    applicant_id TEXT DEFAULT '',
     action TEXT NOT NULL,
     detail TEXT DEFAULT '',
     level TEXT DEFAULT 'INFO'
@@ -103,14 +165,32 @@ CREATE TABLE IF NOT EXISTS crawl_state (
     report TEXT DEFAULT ''
 );
 
+CREATE TABLE IF NOT EXISTS daily_run_state (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_started TEXT NOT NULL,
+    run_completed TEXT DEFAULT '',
+    status TEXT DEFAULT 'RUNNING',
+    events_total INTEGER DEFAULT 0,
+    events_new INTEGER DEFAULT 0,
+    events_updated INTEGER DEFAULT 0,
+    events_researched INTEGER DEFAULT 0,
+    submitted_by_applicant TEXT DEFAULT '{}',
+    applications_blocked INTEGER DEFAULT 0,
+    travel_support_found INTEGER DEFAULT 0,
+    errors TEXT DEFAULT '[]',
+    report_path TEXT DEFAULT ''
+);
+
 CREATE INDEX IF NOT EXISTS idx_events_status ON events(status);
-CREATE INDEX IF NOT EXISTS idx_events_score ON events(score);
+CREATE INDEX IF NOT EXISTS idx_events_score ON events(event_score);
 CREATE INDEX IF NOT EXISTS idx_events_country ON events(country);
-CREATE INDEX IF NOT EXISTS idx_events_start_date ON events(start_date);
 CREATE INDEX IF NOT EXISTS idx_events_fingerprint ON events(fingerprint);
 CREATE INDEX IF NOT EXISTS idx_applications_status ON applications(status);
 CREATE INDEX IF NOT EXISTS idx_applications_event_id ON applications(event_id);
+CREATE INDEX IF NOT EXISTS idx_applications_applicant_id ON applications(applicant_id);
+CREATE INDEX IF NOT EXISTS idx_applications_group ON applications(application_group_id);
 CREATE INDEX IF NOT EXISTS idx_audit_log_event_id ON audit_log(event_id);
+CREATE INDEX IF NOT EXISTS idx_audit_log_applicant_id ON audit_log(applicant_id);
 CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp);
 """
 
@@ -128,19 +208,77 @@ def get_connection() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    """Initialize the database schema."""
     conn = get_connection()
     try:
         conn.executescript(SCHEMA)
+        _migrate_schema(conn)
         conn.commit()
     finally:
         conn.close()
 
 
-# --- Event fingerprinting ---
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """Add lifecycle columns to databases created by older versions."""
+    migrations = {
+        "events": {
+            "hub_travel_status": "TEXT DEFAULT ''",
+            "official_travel_status": "TEXT DEFAULT ''",
+            "final_travel_status": "TEXT DEFAULT ''",
+            "team_status": "TEXT DEFAULT ''",
+            "team_member_scores": "TEXT DEFAULT '{}'",
+            "team_apply_score": "REAL DEFAULT 0.0",
+            "team_member_travel_eligibility": "TEXT DEFAULT '{}'",
+            "team_travel_status": "TEXT DEFAULT ''",
+            "team_application_group_id": "TEXT DEFAULT ''",
+            "application_open_date": "TEXT DEFAULT ''",
+            "last_application_check": "TEXT DEFAULT ''",
+            "next_application_check": "TEXT DEFAULT ''",
+        },
+        "applications": {
+            "form_provider": "TEXT DEFAULT ''",
+            "application_discovery_source": "TEXT DEFAULT ''",
+            "application_discovery_confidence": "REAL DEFAULT 0.0",
+            "application_discovery_reason": "TEXT DEFAULT ''",
+            "application_discovery_path": "TEXT DEFAULT '[]'",
+            "discovery_status": "TEXT DEFAULT ''",
+            "application_open_date": "TEXT DEFAULT ''",
+            "last_application_check": "TEXT DEFAULT ''",
+            "next_application_check": "TEXT DEFAULT ''",
+            "auth_status": "TEXT DEFAULT ''",
+            "auth_platform": "TEXT DEFAULT ''",
+            "auth_login_url": "TEXT DEFAULT ''",
+            "auth_account": "TEXT DEFAULT ''",
+            "source_pages_checked": "TEXT DEFAULT '[]'",
+            "form_metadata": "TEXT DEFAULT '{}'",
+            "form_fillable": "INTEGER DEFAULT 0",
+            "application_open": "INTEGER DEFAULT 0",
+            "fact_check_passed": "INTEGER DEFAULT 0",
+            "cross_profile_check_passed": "INTEGER DEFAULT 0",
+            "duplicate_check_passed": "INTEGER DEFAULT 0",
+            "eligibility_confidence": "REAL DEFAULT 0.0",
+            "eligibility_source_evidence": "TEXT DEFAULT ''",
+            "eligibility_requirements": "TEXT DEFAULT '[]'",
+            "travel_score": "REAL DEFAULT 0.0",
+            "apply_score": "REAL DEFAULT 0.0",
+            "consent_policy_passed": "INTEGER DEFAULT 0",
+            "unreadable_required_fields": "INTEGER DEFAULT 0",
+            "form_validation_status": "TEXT DEFAULT ''",
+            "form_validated_at": "TEXT DEFAULT ''",
+        },
+        "daily_run_state": {
+            "submitted_by_applicant": "TEXT DEFAULT '{}'",
+        },
+    }
+    for table, columns in migrations.items():
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for column, definition in columns.items():
+            if column not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+# --- Fingerprinting ---
 
 def make_fingerprint(event_name: str, start_date: str, organizer: str = "", city: str = "") -> str:
-    """Create a deterministic fingerprint to detect duplicate events."""
     normalized_name = _normalize(event_name)
     normalized_organizer = _normalize(organizer or "")
     normalized_city = _normalize(city or "")
@@ -149,7 +287,6 @@ def make_fingerprint(event_name: str, start_date: str, organizer: str = "", city
 
 
 def _normalize(s: str) -> str:
-    """Normalize a string for fingerprinting."""
     return s.strip().lower().replace(" ", "").replace("-", "").replace("'", "").replace('"', "")
 
 
@@ -183,7 +320,6 @@ def get_event_by_id(event_id: str) -> Optional[dict]:
 
 
 def insert_event(event: dict) -> str:
-    """Insert a new event. Returns the event_id."""
     conn = get_connection()
     try:
         now = datetime.now(timezone.utc).isoformat()
@@ -210,19 +346,22 @@ def insert_event(event: dict) -> str:
             "event_id", "fingerprint", "event_name", "organizer", "hackathonhub_url",
             "event_url", "application_url", "city", "country", "venue",
             "physical_or_online", "start_date", "end_date", "application_deadline",
-            "application_open", "application_status", "description", "themes",
+            "application_open", "description", "themes",
             "sponsors", "judges", "partners", "prizes", "participant_limit",
             "age_requirement", "student_requirement", "nationality_requirement",
+            "eligibility_rules_raw",
             "travel_support", "travel_support_type", "travel_support_amount",
-            "travel_support_currency", "travel_support_confidence", "travel_support_source",
+            "travel_support_currency", "travel_support_confidence",
+            "travel_support_probability", "travel_support_source",
+            "hub_travel_status", "official_travel_status", "final_travel_status",
+            "application_open_date", "last_application_check", "next_application_check",
             "travel_support_details", "flight_credits", "accommodation", "food",
-            "score", "score_reasoning", "confidence", "notes",
+            "event_score", "score_reasoning", "confidence", "notes",
             "date_discovered", "date_last_checked", "status", "extra_data"
         ]
 
         values = [event.get(col, "") for col in columns]
 
-        # Serialize list/dict fields to JSON
         list_fields = {"themes", "sponsors", "judges", "partners", "prizes"}
         dict_fields = {"travel_support_details", "extra_data"}
         for i, col in enumerate(columns):
@@ -244,7 +383,6 @@ def insert_event(event: dict) -> str:
 
 
 def update_event(event_id: str, updates: dict) -> bool:
-    """Update an existing event. Returns True if updated."""
     if not updates:
         return False
     conn = get_connection()
@@ -274,18 +412,17 @@ def get_all_events(status: Optional[str] = None) -> list[dict]:
     try:
         if status:
             rows = conn.execute(
-                "SELECT * FROM events WHERE status = ? ORDER BY score DESC",
+                "SELECT * FROM events WHERE status = ? ORDER BY event_score DESC",
                 (status,)
             ).fetchall()
         else:
-            rows = conn.execute("SELECT * FROM events ORDER BY score DESC").fetchall()
+            rows = conn.execute("SELECT * FROM events ORDER BY event_score DESC").fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
 
 
 def get_events_needing_research() -> list[dict]:
-    """Get events in DISCOVERED or RESEARCHING status."""
     conn = get_connection()
     try:
         rows = conn.execute(
@@ -297,36 +434,20 @@ def get_events_needing_research() -> list[dict]:
 
 
 def get_events_ready_to_apply() -> list[dict]:
-    """Get qualified events ready for application."""
     conn = get_connection()
     try:
         rows = conn.execute(
-            "SELECT * FROM events WHERE status = 'QUALIFIED' ORDER BY score DESC"
+            "SELECT * FROM events WHERE status = 'QUALIFIED' ORDER BY event_score DESC"
         ).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
 
 
-def has_application(event_id: str) -> bool:
-    """Check if an application already exists for this event."""
-    conn = get_connection()
-    try:
-        row = conn.execute(
-            "SELECT 1 FROM applications WHERE event_id = ? AND status NOT IN ('SKIPPED', 'BLOCKED_CAPTCHA', 'BLOCKED_UNKNOWN_FIELD', 'BLOCKED_LOGIN')",
-            (event_id,)
-        ).fetchone()
-        return row is not None
-    finally:
-        conn.close()
-
-
 def find_duplicate_events(event_name: str, start_date: str = "", city: str = "") -> list[dict]:
-    """Find potential duplicate events using fuzzy matching."""
     conn = get_connection()
     try:
         normalized = _normalize(event_name)
-        # Simple substring match on normalized names with same date
         rows = conn.execute(
             "SELECT * FROM events WHERE LOWER(REPLACE(REPLACE(event_name, ' ', ''), '-', '')) LIKE ?",
             (f"%{normalized}%",)
@@ -341,24 +462,81 @@ def find_duplicate_events(event_name: str, start_date: str = "", city: str = "")
         conn.close()
 
 
-# --- Application CRUD ---
+# --- Application CRUD (multi-applicant) ---
+
+def has_application(event_id: str, applicant_id: str) -> bool:
+    """Check if an application exists for this event + applicant."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM applications WHERE event_id = ? AND applicant_id = ? AND status NOT IN ('SKIPPED', 'INELIGIBLE')",
+            (event_id, applicant_id)
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def get_application(event_id: str, applicant_id: str) -> Optional[dict]:
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM applications WHERE event_id = ? AND applicant_id = ?",
+            (event_id, applicant_id)
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_application_by_id(application_id: str) -> Optional[dict]:
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT * FROM applications WHERE application_id = ?", (application_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
 
 def insert_application(app: dict) -> int:
     conn = get_connection()
     try:
+        # Keep inserts idempotent per applicant/event.  An empty unique ID
+        # combined with INSERT OR REPLACE can otherwise replace another
+        # applicant's row and defeat cross-profile safety checks.
+        if not app.get("application_id"):
+            event_id = str(app.get("event_id", ""))
+            applicant_id = str(app.get("applicant_id", ""))
+            if not event_id or not applicant_id:
+                raise ValueError("event_id and applicant_id are required for an application")
+            app["application_id"] = f"app_{event_id[:12]}_{applicant_id}"
         list_fields = {"questions", "answers"}
-        dict_fields = {"submission_snapshot"}
+        dict_fields = {"submission_snapshot", "form_metadata"}
+        json_fields = {"source_pages_checked", "application_discovery_path", "eligibility_requirements"}
         for key, val in app.items():
-            if key in list_fields and not isinstance(val, str):
+            if (key in list_fields or key in json_fields) and not isinstance(val, str):
                 app[key] = json.dumps(val)
             elif key in dict_fields and not isinstance(val, str):
                 app[key] = json.dumps(val)
 
         columns = [
-            "event_id", "event_name", "application_url", "questions", "answers",
-            "date_applied", "application_confirmation", "application_reference",
-            "submission_snapshot", "status", "score", "score_reasoning",
-            "travel_support_status", "notes"
+            "application_id", "event_id", "applicant_id", "applicant_name",
+            "application_url", "application_group_id", "questions", "answers",
+            "date_started", "date_submitted", "application_confirmation",
+            "application_reference", "submission_snapshot", "status",
+            "event_score", "applicant_fit_score", "travel_score", "apply_score", "eligibility_status",
+            "eligibility_reasoning", "travel_eligible", "travel_support_requested",
+            "score_reasoning", "travel_support_status", "form_provider",
+            "application_discovery_source", "application_discovery_confidence",
+            "application_discovery_reason", "application_discovery_path", "discovery_status",
+            "application_open_date", "last_application_check", "next_application_check",
+            "auth_status", "auth_platform", "auth_login_url", "auth_account",
+            "source_pages_checked", "form_metadata",
+            "form_fillable", "application_open", "fact_check_passed",
+            "cross_profile_check_passed", "duplicate_check_passed", "consent_policy_passed", "unreadable_required_fields",
+            "form_validation_status", "form_validated_at",
+            "eligibility_confidence", "eligibility_source_evidence",
+            "eligibility_requirements", "notes"
         ]
         values = [app.get(col, "") for col in columns]
         placeholders = ", ".join(["?" for _ in columns])
@@ -374,66 +552,114 @@ def insert_application(app: dict) -> int:
         conn.close()
 
 
-def update_application(event_id: str, updates: dict) -> bool:
+def update_application(event_id: str, applicant_id: str, updates: dict) -> bool:
     conn = get_connection()
     try:
         list_fields = {"questions", "answers"}
-        dict_fields = {"submission_snapshot"}
+        dict_fields = {"submission_snapshot", "form_metadata"}
+        json_fields = {"source_pages_checked", "application_discovery_path", "eligibility_requirements"}
         for key, val in updates.items():
-            if key in list_fields and not isinstance(val, str):
+            if (key in list_fields or key in json_fields) and not isinstance(val, str):
                 updates[key] = json.dumps(val)
             elif key in dict_fields and not isinstance(val, str):
                 updates[key] = json.dumps(val)
 
         set_clause = ", ".join([f"{k} = ?" for k in updates])
-        values = list(updates.values()) + [event_id]
-        conn.execute(f"UPDATE applications SET {set_clause} WHERE event_id = ?", values)
+        values = list(updates.values()) + [event_id, applicant_id]
+        conn.execute(f"UPDATE applications SET {set_clause} WHERE event_id = ? AND applicant_id = ?", values)
         conn.commit()
         return conn.total_changes > 0
     finally:
         conn.close()
 
 
-def get_application(event_id: str) -> Optional[dict]:
+def get_all_applications(applicant_id: Optional[str] = None) -> list[dict]:
     conn = get_connection()
     try:
-        row = conn.execute("SELECT * FROM applications WHERE event_id = ?", (event_id,)).fetchone()
-        return dict(row) if row else None
-    finally:
-        conn.close()
-
-
-def get_all_applications() -> list[dict]:
-    conn = get_connection()
-    try:
-        rows = conn.execute("SELECT * FROM applications ORDER BY date_applied DESC").fetchall()
+        if applicant_id:
+            rows = conn.execute(
+                "SELECT * FROM applications WHERE applicant_id = ? ORDER BY date_submitted DESC",
+                (applicant_id,)
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM applications ORDER BY date_submitted DESC").fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
 
 
-# --- Audit log ---
+def get_applications_by_status(status: str) -> list[dict]:
+    """Return application records in one lifecycle status."""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM applications WHERE status = ? ORDER BY event_score DESC, applicant_fit_score DESC",
+            (status,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
-def log_audit(event_id: str, action: str, detail: str = "", level: str = "INFO") -> None:
+
+def get_applications_for_event(event_id: str) -> list[dict]:
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM applications WHERE event_id = ? ORDER BY applicant_id",
+            (event_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+# --- Application groups ---
+
+def create_application_group(group_id: str, event_id: str, applicant_ids: list[str]) -> None:
     conn = get_connection()
     try:
         now = datetime.now(timezone.utc).isoformat()
         conn.execute(
-            "INSERT INTO audit_log (timestamp, event_id, action, detail, level) VALUES (?, ?, ?, ?, ?)",
-            (now, event_id, action, detail, level)
+            "INSERT OR IGNORE INTO application_groups (group_id, event_id, applicant_ids, created_at) VALUES (?, ?, ?, ?)",
+            (group_id, event_id, json.dumps(applicant_ids), now)
         )
         conn.commit()
     finally:
         conn.close()
 
 
-def get_audit_log(event_id: Optional[str] = None, limit: int = 100) -> list[dict]:
+# --- Audit log ---
+
+def log_audit(event_id: str, action: str, detail: str = "", level: str = "INFO", applicant_id: str = "") -> None:
     conn = get_connection()
     try:
-        if event_id:
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "INSERT INTO audit_log (timestamp, event_id, applicant_id, action, detail, level) VALUES (?, ?, ?, ?, ?, ?)",
+            (now, event_id, applicant_id, action, detail, level)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_audit_log(event_id: Optional[str] = None, applicant_id: Optional[str] = None, limit: int = 100) -> list[dict]:
+    conn = get_connection()
+    try:
+        if event_id and applicant_id:
+            rows = conn.execute(
+                "SELECT * FROM audit_log WHERE event_id = ? AND applicant_id = ? ORDER BY timestamp DESC LIMIT ?",
+                (event_id, applicant_id, limit)
+            ).fetchall()
+        elif event_id:
             rows = conn.execute(
                 "SELECT * FROM audit_log WHERE event_id = ? ORDER BY timestamp DESC LIMIT ?",
                 (event_id, limit)
+            ).fetchall()
+        elif applicant_id:
+            rows = conn.execute(
+                "SELECT * FROM audit_log WHERE applicant_id = ? ORDER BY timestamp DESC LIMIT ?",
+                (applicant_id, limit)
             ).fetchall()
         else:
             rows = conn.execute(
@@ -465,9 +691,163 @@ def save_crawl_state(state: dict) -> None:
 def get_last_crawl() -> Optional[dict]:
     conn = get_connection()
     try:
+        row = conn.execute("SELECT * FROM crawl_state ORDER BY id DESC LIMIT 1").fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+# --- Daily run state ---
+
+def start_daily_run() -> int:
+    """Start a new daily run. Returns the run ID."""
+    conn = get_connection()
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        cursor = conn.execute(
+            "INSERT INTO daily_run_state (run_started, status) VALUES (?, 'RUNNING')",
+            (now,)
+        )
+        conn.commit()
+        return cursor.lastrowid
+    finally:
+        conn.close()
+
+
+def complete_daily_run(run_id: int, state: dict) -> None:
+    """Mark a daily run as completed with summary data."""
+    conn = get_connection()
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            """UPDATE daily_run_state SET
+               run_completed = ?, status = 'COMPLETED',
+               events_total = ?, events_new = ?, events_updated = ?,
+               events_researched = ?, submitted_by_applicant = ?, applications_blocked = ?,
+               travel_support_found = ?, errors = ?, report_path = ?
+               WHERE id = ?""",
+            (now, state.get("events_total", 0), state.get("events_new", 0),
+             state.get("events_updated", 0), state.get("events_researched", 0),
+              json.dumps(state.get("submitted_by_applicant", {})),
+             state.get("applications_blocked", 0), state.get("travel_support_found", 0),
+             json.dumps(state.get("errors", [])), state.get("report_path", ""),
+             run_id)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def fail_daily_run(run_id: int, error: str) -> None:
+    """Mark a daily run as failed."""
+    conn = get_connection()
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "UPDATE daily_run_state SET run_completed = ?, status = 'FAILED', errors = ? WHERE id = ?",
+            (now, json.dumps([error]), run_id)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_last_daily_run() -> Optional[dict]:
+    """Get the most recent daily run."""
+    conn = get_connection()
+    try:
         row = conn.execute(
-            "SELECT * FROM crawl_state ORDER BY id DESC LIMIT 1"
+            "SELECT * FROM daily_run_state ORDER BY id DESC LIMIT 1"
         ).fetchone()
         return dict(row) if row else None
     finally:
         conn.close()
+
+
+def is_daily_run_active() -> bool:
+    """Check if a daily run is currently RUNNING (within last 30 minutes)."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT run_started FROM daily_run_state WHERE status = 'RUNNING' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if not row:
+            return False
+        started = datetime.fromisoformat(row["run_started"])
+        now = datetime.now(timezone.utc)
+        elapsed = (now - started).total_seconds()
+        # If a run started more than 30 minutes ago, it's stale
+        if elapsed > 1800:
+            return False
+        return True
+    finally:
+        conn.close()
+
+
+def get_events_needing_stage2_research() -> list[dict]:
+    """
+    Get events that need external research:
+    - NEW or RESEARCHING status
+    - Or UPDATED with material changes
+    - Plus events that pass Stage 1 scoring
+    """
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """SELECT * FROM events WHERE status IN ('DISCOVERED', 'RESEARCHING', 'UPDATED')
+               OR (status = 'QUALIFIED' AND event_score > 0)
+               ORDER BY event_score DESC"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_events_with_pending_applications() -> list[dict]:
+    """Get events where at least one applicant has a QUALIFIED or READY_TO_APPLY application."""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """SELECT DISTINCT e.* FROM events e
+               JOIN applications a ON e.event_id = a.event_id
+               WHERE a.status IN ('QUALIFIED', 'READY_TO_APPLY')
+               ORDER BY e.event_score DESC"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_pending_applications(applicant_id: str) -> list[dict]:
+    """Get pending applications for a specific applicant."""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM applications WHERE applicant_id = ? AND status IN ('QUALIFIED', 'READY_TO_APPLY')",
+            (applicant_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+# --- Run lock (file-based) ---
+
+def acquire_run_lock() -> bool:
+    """Try to acquire the daily run lock. Returns True if acquired."""
+    lock_path = Path(settings.DATABASE_PATH).parent / "daily_run.lock"
+    if lock_path.exists():
+        # Check if stale (>2 hours old)
+        mtime = lock_path.stat().st_mtime
+        if time.time() - mtime > 7200:
+            lock_path.unlink(missing_ok=True)
+        else:
+            return False
+    lock_path.write_text(str(datetime.now(timezone.utc).isoformat()))
+    return True
+
+
+def release_run_lock() -> None:
+    """Release the daily run lock."""
+    lock_path = Path(settings.DATABASE_PATH).parent / "daily_run.lock"
+    lock_path.unlink(missing_ok=True)

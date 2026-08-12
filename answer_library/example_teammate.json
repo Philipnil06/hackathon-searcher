@@ -1,0 +1,6 @@
+{
+  "answers": [
+    {"id": "about", "question_patterns": ["tell us about yourself", "about you"], "answer": "I am Sam Teammate, a fictional example applicant. Replace this answer with truthful details about your own work."},
+    {"id": "portfolio", "question_patterns": ["portfolio", "github", "website"], "answer": "https://github.com/example"}
+  ]
+}

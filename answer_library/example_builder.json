@@ -1,0 +1,7 @@
+{
+  "answers": [
+    {"id": "about", "question_patterns": ["tell us about yourself", "about you"], "answer": "I am Alex Builder, a fictional example applicant. Replace this answer with truthful details about your own work."},
+    {"id": "portfolio", "question_patterns": ["portfolio", "github", "website"], "answer": "https://github.com/example"},
+    {"id": "motivation", "question_patterns": ["why this hackathon", "why do you want to attend"], "answer": "I want to collaborate on a practical prototype and learn from other builders."}
+  ]
+}

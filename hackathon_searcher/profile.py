@@ -1,9 +1,8 @@
 """
-Profile management for Philip's verified facts.
+Multi-applicant profile management.
 
-Loads profile.json and answer_library.json.
-Provides semantic matching for application questions.
-All answers are derived from verified facts only — no hallucinations.
+Loads profiles from profiles/ directory and answer libraries from answer_library/.
+Each applicant gets their own verified facts and answer library.
 """
 
 import json
@@ -11,11 +10,13 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Optional
 
+from hackathon_searcher.settings import settings
 
-class Profile:
-    """Centralized profile with all verified facts about Philip."""
 
-    def __init__(self, profile_path: str = "profile.json", answer_library_path: str = "answer_library.json"):
+class ApplicantProfile:
+    """A single applicant's verified profile and answer library."""
+
+    def __init__(self, profile_path: str, answer_library_path: str):
         self.profile_path = Path(profile_path)
         self.answer_library_path = Path(answer_library_path)
         self.data: dict = {}
@@ -34,67 +35,141 @@ class Profile:
     def reload(self) -> None:
         self._load()
 
-    def get(self, key: str, default=None):
-        return self.data.get(key, default)
+    @property
+    def applicant_id(self) -> str:
+        return self.data.get("applicant_id", "")
 
     @property
     def name(self) -> str:
         return self.data.get("name", "")
 
     @property
+    def full_name(self) -> str:
+        return self.data.get("full_name", self.data.get("name", ""))
+
+    @property
+    def email(self) -> str:
+        return self.data.get("email", "")
+
+    @property
+    def google_oauth_email(self) -> str:
+        return self.data.get("google_oauth_email", self.data.get("email", ""))
+
+    @property
+    def phone(self) -> str:
+        return self.data.get("phone", "")
+
+    @property
     def city(self) -> str:
-        return self.data.get("location", {}).get("city", "")
+        return self.data.get("location", {}).get("city", self.data.get("home_city", ""))
 
     @property
     def country(self) -> str:
-        return self.data.get("location", {}).get("country", "")
+        return self.data.get("location", {}).get("country", self.data.get("home_country", ""))
+
+    @property
+    def home_city(self) -> str:
+        return self.data.get("home_city", "")
+
+    @property
+    def home_country(self) -> str:
+        return self.data.get("home_country", "")
+
+    @property
+    def travel_origin(self) -> str:
+        return self.data.get("travel_origin", self.home_city)
 
     @property
     def age(self) -> int:
         return self.data.get("age", 0)
 
     @property
-    def education(self) -> str:
-        return self.data.get("education", "")
+    def education(self) -> dict:
+        return self.data.get("education", {})
+
+    @property
+    def education_text(self) -> str:
+        edu = self.education
+        if edu.get("degree"):
+            return edu["degree"]
+        if edu.get("english_description"):
+            return edu["english_description"]
+        return ""
+
+    @property
+    def current_student(self) -> bool:
+        return self.education.get("current_student", False)
+
+    @property
+    def is_university_student(self) -> bool:
+        return self.education.get("is_university_student", False)
+
+    @property
+    def is_high_school_student(self) -> bool:
+        return self.education.get("is_high_school_student", False)
+
+    @property
+    def linkedin(self) -> str:
+        return self.data.get("linkedin", "")
+
+    @property
+    def github(self) -> str:
+        return self.data.get("github", "")
+
+    @property
+    def website(self) -> str:
+        return self.data.get("website", "")
+
+    @property
+    def portfolio(self) -> str:
+        return self.data.get("portfolio", "")
 
     @property
     def interests(self) -> list[str]:
         return self.data.get("interests", [])
 
     @property
-    def hackathon_experience(self) -> list[str]:
-        return self.data.get("hackathon_experience", [])
-
-    @property
-    def products(self) -> list[dict]:
-        return self.data.get("products", [])
+    def projects(self) -> list[dict]:
+        return self.data.get("projects", [])
 
     @property
     def work_experience(self) -> list[dict]:
         return self.data.get("work_experience", [])
 
     @property
-    def contact(self) -> dict:
-        return self.data.get("contact", {})
+    def hackathon_experience(self) -> list:
+        return self.data.get("hackathon_experience", [])
 
     @property
-    def travel_preferences(self) -> dict:
-        return self.data.get("travel_preferences", {})
+    def achievements(self) -> list[dict]:
+        return self.data.get("achievements", [])
 
     @property
-    def consent(self) -> dict:
-        return self.data.get("consent", {})
+    def growth_experience(self) -> dict:
+        return self.data.get("growth_experience", {})
 
     @property
-    def requires_travel_support(self) -> bool:
-        return self.travel_preferences.get("requires_travel_support", False)
+    def travel_support_wanted(self) -> bool:
+        return self.data.get("travel_support_wanted", False)
 
     @property
-    def willing_to_travel(self) -> bool:
-        return self.travel_preferences.get("willing_to_travel", True)
+    def dietary_requirements(self) -> str:
+        return self.data.get("dietary_requirements", "")
+
+    @property
+    def auth_type(self) -> str:
+        return self.data.get("auth", {}).get("type", "standard")
+
+    @property
+    def skills(self) -> list[str]:
+        return self.data.get("skills", [])
+
+    @property
+    def default_partner(self) -> str:
+        return self.data.get("team", {}).get("default_partner", "")
 
     def match_answer(self, question: str, event_context: Optional[dict] = None) -> Optional[dict]:
-        """Semantically match a question to the answer library. Returns {answer, id, confidence} or None."""
+        """Semantically match a question to the answer library."""
         question_lower = question.lower().strip()
         best_match: Optional[dict] = None
         best_score = 0.0
@@ -102,7 +177,6 @@ class Profile:
         for entry in self.answers:
             for pattern in entry.get("question_patterns", []):
                 score = SequenceMatcher(None, question_lower, pattern.lower()).ratio()
-                # Boost for substring matches
                 if pattern.lower() in question_lower:
                     score = max(score, 0.85)
                 if score > best_score:
@@ -113,49 +187,7 @@ class Profile:
             return best_match
         return None
 
-    def get_tailored_answer(self, question: str, event_context: Optional[dict] = None) -> str:
-        """
-        Get an answer tailored to the event context.
-        Uses the answer library as a base, then adjusts for context.
-        """
-        match = self.match_answer(question, event_context)
-        if not match:
-            return ""
-
-        answer = match["answer"]
-
-        if not event_context:
-            return answer
-
-        # Add event-specific tailoring
-        themes = event_context.get("themes", [])
-        if isinstance(themes, str):
-            try:
-                themes = json.loads(themes)
-            except (json.JSONDecodeError, TypeError):
-                themes = []
-
-        event_name = event_context.get("event_name", "")
-
-        # Tailor "why hackathon" for specific themes
-        if match["id"] == "why_hackathon":
-            theme_str = ", ".join(themes[:2]) if themes else "technology and building"
-            answer = answer.replace(
-                "This hackathon's focus aligns with the kind of products I want to create",
-                f"I'm drawn to {event_name} because its focus on {theme_str} aligns with what I love building"
-            )
-
-        # Tailor "why accept me" for specific themes
-        if match["id"] == "why_accept_me":
-            if any(t.lower() in ["ai", "artificial intelligence"] for t in themes):
-                answer += " I'm particularly excited about building AI products that solve real problems."
-            elif any(t.lower() in ["hardware", "robotics", "drones"] for t in themes):
-                answer += " My robotics and CNC background gives me a practical edge I bring to hardware projects."
-
-        return answer
-
     def has_fact(self, key_path: str) -> bool:
-        """Check if a specific fact exists in the profile. e.g. 'contact.email'."""
         parts = key_path.split(".")
         current = self.data
         for part in parts:
@@ -166,7 +198,6 @@ class Profile:
         return bool(current) if not isinstance(current, (dict, list)) else bool(current)
 
     def get_fact(self, key_path: str, default=None):
-        """Get a specific fact by dotted path."""
         parts = key_path.split(".")
         current = self.data
         for part in parts:
@@ -177,4 +208,52 @@ class Profile:
         return current
 
 
-profile = Profile()
+class ProfileManager:
+    """Manages multiple applicant profiles."""
+
+    def __init__(self):
+        self._profiles: dict[str, ApplicantProfile] = {}
+        self._load_profiles()
+
+    def _load_profiles(self) -> None:
+        profiles_dir = Path(settings.PROFILES_DIR)
+        if not profiles_dir.exists():
+            return
+
+        for profile_file in profiles_dir.glob("*.json"):
+            if profile_file.stem.startswith("example_"):
+                continue
+            applicant_id = profile_file.stem
+            answer_lib_path = Path(settings.ANSWER_LIBRARY_DIR) / f"{applicant_id}.json"
+            self._profiles[applicant_id] = ApplicantProfile(
+                str(profile_file), str(answer_lib_path)
+            )
+
+    def reload(self) -> None:
+        self._profiles.clear()
+        self._load_profiles()
+
+    def get(self, applicant_id: str) -> Optional[ApplicantProfile]:
+        return self._profiles.get(applicant_id)
+
+    @property
+    def applicant_ids(self) -> list[str]:
+        return list(self._profiles.keys())
+
+    @property
+    def all_profiles(self) -> list[ApplicantProfile]:
+        return list(self._profiles.values())
+
+    def get_profile_data(self, applicant_id: str) -> dict:
+        """Get raw profile data for LLM context."""
+        profile = self.get(applicant_id)
+        return profile.data if profile else {}
+
+    def get_answer_library(self, applicant_id: str) -> list[dict]:
+        """Get answer library entries for LLM context."""
+        profile = self.get(applicant_id)
+        return profile.answers if profile else []
+
+
+# Global instance
+profile_manager = ProfileManager()

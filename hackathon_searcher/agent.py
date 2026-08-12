@@ -1,62 +1,54 @@
 """
-Agent orchestrator — runs the full daily pipeline.
+Agent orchestrator — multi-applicant edition.
 
-Coordinates discovery, research, scoring, and application submission.
-Designed to be idempotent and failure-isolated per event.
+Runs the full daily pipeline for all applicants:
+1. Discover events
+2. Research events (external websites, LLM analysis)
+3. Score events + per-applicant fit
+4. Generate per-applicant applications
+5. Submit (or dry-run simulate)
+6. Produce daily report
+
+Designed to be idempotent and failure-isolated per event per applicant.
 """
 
 import json
+import os
 from datetime import datetime, timezone
 from typing import Optional
 
 from hackathon_searcher.database import (
-    init_db,
-    get_event_by_id,
-    get_events_needing_research,
-    get_events_ready_to_apply,
-    has_application,
-    insert_application,
-    update_application,
-    update_event,
-    log_audit,
-    save_crawl_state,
-    get_all_events,
-    get_all_applications,
+    init_db, get_event_by_id, get_events_needing_research,
+    get_events_ready_to_apply, has_application, get_application,
+    insert_application, update_application, update_event,
+    log_audit, save_crawl_state, get_all_events, get_all_applications,
+    get_applications_for_event, create_application_group,
 )
 from hackathon_searcher.event_research import research_event
 from hackathon_searcher.forms import (
-    extract_form_fields,
-    generate_answer,
-    create_submission_snapshot,
-    validate_application,
-    detect_form_provider,
+    extract_form_fields, generate_answer_for_field,
+    create_submission_snapshot, validate_application,
+)
+from hackathon_searcher.llm import (
+    analyze_event_page, estimate_travel_support_probability,
+    review_application_quality, complete_structured, complete,
 )
 from hackathon_searcher.models import FormField, FormSnapshot, DailyReport
-from hackathon_searcher.profile import profile
-from hackathon_searcher.scoring import score_event
+from hackathon_searcher.profile import profile_manager, ApplicantProfile
+from hackathon_searcher.scoring import score_event, score_applicant_fit
 from hackathon_searcher.scraper import discover_events, process_discovered_events
 from hackathon_searcher.settings import settings
 
 
 def run_daily_pipeline() -> DailyReport:
-    """
-    Run the full daily pipeline:
-
-    1. Discover new events from Hackathon Hub
-    2. Research new/updated events
-    3. Score all researched events
-    4. Apply to qualified events
-    5. Produce daily report
-    """
+    """Run the full daily pipeline for all applicants."""
     print("=" * 60)
-    print("DAILY HACKATHON SEARCH — Starting pipeline")
+    print("DAILY HACKATHON SEARCH — Multi-Applicant Pipeline")
+    print(f"Applicants: {', '.join(profile_manager.applicant_ids)}")
     print(f"Dry run: {settings.DRY_RUN}")
-    print(f"Auto apply: {settings.AUTO_APPLY}")
     print("=" * 60)
 
-    # Ensure database is initialized
     init_db()
-
     report = DailyReport(timestamp=datetime.now(timezone.utc).isoformat())
     errors: list[str] = []
 
@@ -66,7 +58,6 @@ def run_daily_pipeline() -> DailyReport:
         raw_events = discover_events()
         report.events_scanned = len(raw_events)
         print(f"  Scanned: {len(raw_events)} events")
-
         new_ids, updated_ids, skipped = process_discovered_events(raw_events)
         report.events_new = len(new_ids)
         report.events_updated = len(updated_ids)
@@ -80,100 +71,137 @@ def run_daily_pipeline() -> DailyReport:
     try:
         events_to_research = get_events_needing_research()
         print(f"  Researching {len(events_to_research)} events...")
-
         for event in events_to_research:
             try:
-                # Mark as researching
                 update_event(event["event_id"], {"status": "RESEARCHING"})
-
                 findings = research_event(event["event_id"])
 
-                # If no external URL, score anyway based on what we have
-                if not event.get("event_url"):
-                    log_audit(event["event_id"], "NO_EXTERNAL_URL", "No external event URL to research")
+                # LLM-enhanced research if we have page content
+                if findings.get("all_text"):
+                    try:
+                        llm_analysis = analyze_event_page(
+                            findings["all_text"],
+                            event.get("event_name", "")
+                        )
+                        if llm_analysis:
+                            _merge_llm_findings(event["event_id"], llm_analysis)
+                    except Exception as e:
+                        print(f"  LLM analysis failed for {event.get('event_name')}: {e}")
 
-                log_audit(event["event_id"], "RESEARCHED", f"Findings: {len(findings)} fields updated")
+                # Estimate travel support probability if not confirmed
+                ts = findings.get("travel_support", "") or event.get("travel_support", "")
+                if ts in ("NO_TRAVEL_INFORMATION", "POSSIBLE_TRAVEL_SUPPORT", "UNKNOWN", ""):
+                    try:
+                        prob_result = estimate_travel_support_probability(
+                            event, [findings.get("all_text", "")]
+                        )
+                        if prob_result:
+                            update_event(event["event_id"], {
+                                "travel_support_probability": prob_result.get("probability", 0.0),
+                            })
+                    except Exception:
+                        pass
+
+                log_audit(event["event_id"], "RESEARCHED", f"{len(findings)} fields updated")
             except Exception as e:
                 errors.append(f"Research failed for {event.get('event_id')}: {e}")
-                print(f"  ERROR researching {event.get('event_name')}: {e}")
+                print(f"  ERROR: {e}")
     except Exception as e:
         errors.append(f"Research phase failed: {e}")
-        print(f"  ERROR: {e}")
 
     # === Step 3: Score ===
-    print("\n[3/5] SCORING EVENTS...")
+    print("\n[3/5] SCORING EVENTS & APPLICANTS...")
+    high_score_events = []
     try:
         events_to_score = get_events_needing_research()
         print(f"  Scoring {len(events_to_score)} events...")
-        high_score_events = []
-
         for event in events_to_score:
             try:
-                result = score_event(event["event_id"])
-                if result.get("total_score", 0) >= settings.NOTIFY_HIGH_SCORE_THRESHOLD:
+                event_result = score_event(event["event_id"])
+                for applicant_id in profile_manager.applicant_ids:
+                    fit = score_applicant_fit(event["event_id"], applicant_id)
+                    if fit.get("should_apply"):
+                        # Create application record
+                        app_id = f"app_{event['event_id'][:12]}_{applicant_id}"
+                        if not has_application(event["event_id"], applicant_id):
+                            insert_application({
+                                "application_id": app_id,
+                                "event_id": event["event_id"],
+                                "applicant_id": applicant_id,
+                                "applicant_name": profile_manager.get(applicant_id).name,
+                                "application_url": event.get("application_url", ""),
+                                "date_started": datetime.now(timezone.utc).isoformat(),
+                                "status": "QUALIFIED",
+                                "event_score": event_result.get("event_score", 0),
+                                "applicant_fit_score": fit.get("fit_score", 0),
+                                "eligibility_status": "ELIGIBLE" if fit.get("eligible") else "INELIGIBLE",
+                                "eligibility_reasoning": fit.get("eligibility_reasoning", ""),
+                                "travel_eligible": 1 if fit.get("travel_eligible") else 0,
+                                "travel_support_requested": 1,
+                                "score_reasoning": fit.get("apply_reason", ""),
+                                "travel_support_status": event.get("travel_support", ""),
+                            })
+                            log_audit(event["event_id"], "APPLICANT_QUALIFIED",
+                                      f"{applicant_id}: fit={fit.get('fit_score')}", applicant_id=applicant_id)
+
+                if event_result.get("event_score", 0) >= settings.NOTIFY_HIGH_SCORE_THRESHOLD:
                     high_score_events.append({
                         "name": event.get("event_name"),
-                        "score": result.get("total_score"),
-                        "reason": result.get("reasoning", ""),
+                        "score": event_result.get("event_score"),
                         "travel": event.get("travel_support", "Unknown"),
                     })
             except Exception as e:
                 errors.append(f"Scoring failed for {event.get('event_id')}: {e}")
-                print(f"  ERROR scoring {event.get('event_name')}: {e}")
 
         report.new_high_score_events = high_score_events
     except Exception as e:
         errors.append(f"Scoring phase failed: {e}")
-        print(f"  ERROR: {e}")
 
     # === Step 4: Apply ===
     print("\n[4/5] PROCESSING APPLICATIONS...")
-    applications_submitted = 0
-    applications_blocked = 0
-
+    submitted = 0
+    blocked = 0
     try:
-        qualified_events = get_events_ready_to_apply()
-        print(f"  Qualified events: {len(qualified_events)}")
-
-        for event in qualified_events:
-            try:
-                result = process_application(event)
-                if result.get("status") == "APPLIED":
-                    applications_submitted += 1
-                elif result.get("status", "").startswith("BLOCKED"):
-                    applications_blocked += 1
-            except Exception as e:
-                errors.append(f"Application failed for {event.get('event_id')}: {e}")
-                print(f"  ERROR applying to {event.get('event_name')}: {e}")
-
-        report.applications_submitted = applications_submitted
-        report.applications_blocked = applications_blocked
-        print(f"  Submitted: {applications_submitted}, Blocked: {applications_blocked}")
+        for applicant_id in profile_manager.applicant_ids:
+            apps = get_all_applications(applicant_id)
+            for app in apps:
+                if app.get("status") in ("QUALIFIED", "READY_TO_APPLY"):
+                    try:
+                        result = process_application_for_applicant(
+                            app["event_id"], applicant_id
+                        )
+                        if result.get("status") == "APPLIED" or result.get("status") == "DRY_RUN_COMPLETE":
+                            submitted += 1
+                        elif result.get("status", "").startswith("BLOCKED"):
+                            blocked += 1
+                    except Exception as e:
+                        errors.append(f"Application failed for {applicant_id} @ {app.get('event_id')}: {e}")
     except Exception as e:
         errors.append(f"Application phase failed: {e}")
-        print(f"  ERROR: {e}")
 
-    # === Step 5: Build report ===
+    report.applications_submitted = submitted
+    report.applications_blocked = blocked
+    print(f"  Submitted: {submitted}, Blocked: {blocked}")
+
+    # === Step 5: Report ===
     print("\n[5/5] BUILDING REPORT...")
     try:
-        # Get top applications
         apps = get_all_applications()
         report.top_applications = [
             {
-                "event_name": app.get("event_name"),
-                "score": app.get("score"),
-                "status": app.get("status"),
-                "travel_support": app.get("travel_support_status"),
-                "date_applied": app.get("date_applied"),
+                "event_name": a.get("event_name"),
+                "applicant": a.get("applicant_name"),
+                "score": a.get("applicant_fit_score"),
+                "status": a.get("status"),
+                "travel": a.get("travel_support_status"),
             }
-            for app in apps[:5]
+            for a in apps[:10]
         ]
     except Exception as e:
-        errors.append(f"Report building failed: {e}")
+        errors.append(f"Report failed: {e}")
 
     report.errors = errors
 
-    # Save crawl state
     try:
         save_crawl_state({
             "events_scanned": report.events_scanned,
@@ -189,36 +217,46 @@ def run_daily_pipeline() -> DailyReport:
     return report
 
 
-def process_application(event: dict) -> dict:
+def process_application_for_applicant(event_id: str, applicant_id: str) -> dict:
     """
-    Process an application for a qualified event.
+    Process an application for a specific event + applicant.
 
-    1. Check for duplicates
-    2. Find the application form
-    3. Extract and answer fields
-    4. Create submission snapshot
-    5. Submit (or simulate in dry run)
-    6. Store results
+    Steps:
+    1. Check duplicates
+    2. Get applicant profile
+    3. Find/fetch application form
+    4. Extract form fields
+    5. Generate answers per field
+    6. Validate
+    7. Create snapshot
+    8. Submit (or dry-run)
     """
-    event_id = event["event_id"]
+    event = get_event_by_id(event_id)
+    if not event:
+        return {"status": "ERROR", "error": "Event not found"}
+
+    profile = profile_manager.get(applicant_id)
+    if not profile:
+        return {"status": "ERROR", "error": f"Applicant {applicant_id} not found"}
+
     event_name = event.get("event_name", "")
 
-    # Check for existing application (duplicate prevention)
-    if has_application(event_id):
-        log_audit(event_id, "DUPLICATE_SKIP", "Application already exists")
-        return {"status": "DUPLICATE_SKIPPED"}
+    # Duplicate check
+    if has_application(event_id, applicant_id):
+        existing = get_application(event_id, applicant_id)
+        if existing and existing.get("status") not in ("QUALIFIED", "READY_TO_APPLY", "SKIPPED", "INELIGIBLE"):
+            log_audit(event_id, "DUPLICATE_SKIP", f"{applicant_id}: already applied", applicant_id=applicant_id)
+            return {"status": "DUPLICATE_SKIPPED"}
 
-    # Update status
-    update_event(event_id, {"status": "READY_TO_APPLY"})
-    log_audit(event_id, "APPLICATION_START", f"Starting application for {event_name}")
+    update_application(event_id, applicant_id, {"status": "READY_TO_APPLY"})
+    log_audit(event_id, "APPLICATION_START", f"{applicant_id}: starting", applicant_id=applicant_id)
 
     # Determine application URL
     application_url = event.get("application_url", "") or event.get("event_url", "")
     if not application_url:
-        # Try to discover the application form from the event website
         try:
             from hackathon_searcher.browser import discover_application_form
-            discovered = discover_application_form(event.get("event_url", ""))
+            discovered = discover_application_form(event.get("event_url", ""), applicant_id)
             if discovered:
                 application_url = discovered
                 update_event(event_id, {"application_url": discovered})
@@ -226,11 +264,11 @@ def process_application(event: dict) -> dict:
             pass
 
     if not application_url:
-        log_audit(event_id, "NO_APPLICATION_URL", "No application URL found")
-        update_event(event_id, {"status": "BLOCKED_LOGIN"})
-        return {"status": "BLOCKED_LOGIN", "error": "No application URL"}
+        log_audit(event_id, "NO_APPLICATION_URL", "", applicant_id=applicant_id)
+        update_application(event_id, applicant_id, {"status": "BLOCKED_LOGIN"})
+        return {"status": "BLOCKED_LOGIN"}
 
-    # Try to get the form HTML
+    # Extract form fields
     fields: list[FormField] = []
     try:
         from hackathon_searcher.event_research import fetch_page
@@ -238,142 +276,165 @@ def process_application(event: dict) -> dict:
         if html:
             fields = extract_form_fields(html, application_url)
     except Exception as e:
-        print(f"[agent] Failed to fetch application form: {e}")
+        print(f"[agent] Form fetch failed: {e}")
 
     if not fields:
-        # Try with browser
         try:
             from hackathon_searcher.browser import BrowserSession
             with BrowserSession() as browser:
                 if browser.navigate(application_url):
                     html = browser.get_page_html()
                     fields = extract_form_fields(html, application_url)
-        except (ImportError, Exception) as e:
+        except Exception as e:
             print(f"[agent] Browser form extraction failed: {e}")
 
-    if not fields:
-        log_audit(event_id, "NO_FORM_FIELDS", "Could not extract form fields")
-        # Still try to submit with just the URL
-        fields = []
+    # Build event context
+    themes_raw = event.get("themes", "[]")
+    try:
+        themes = json.loads(themes_raw) if isinstance(themes_raw, str) else themes_raw
+    except (json.JSONDecodeError, TypeError):
+        themes = []
 
-    # Generate answers for each field
     event_context = {
         "event_name": event_name,
-        "themes": event.get("themes", []),
+        "themes": themes,
         "travel_support": event.get("travel_support", ""),
         "organizer": event.get("organizer", ""),
+        "description": event.get("description", ""),
+        "city": event.get("city", ""),
+        "country": event.get("country", ""),
     }
 
+    # Generate answers
     unknown_required = []
+    answers = []
     for field in fields:
-        answer = generate_answer(field, event_context)
+        answer = generate_answer_for_field(field, profile, event_context, use_llm=True)
         field.answer = answer
+        answers.append({"label": field.label, "answer": answer, "source": field.answer_source})
         if answer == "UNKNOWN_REQUIRED_FIELD":
             unknown_required.append(field)
 
-    # If there are unknown required fields, block the application
+    # Handle unknown required fields
     if unknown_required:
-        blocked_reason = f"Unknown required fields: {[f.label for f in unknown_required]}"
-        log_audit(event_id, "BLOCKED_UNKNOWN_FIELD", blocked_reason)
-        update_event(event_id, {"status": "BLOCKED_UNKNOWN_FIELD"})
-
-        # Store the application with what we have
-        insert_application({
-            "event_id": event_id,
-            "event_name": event_name,
-            "application_url": application_url,
-            "questions": [f.model_dump() for f in fields],
-            "answers": [{"label": f.label, "answer": f.answer} for f in fields],
+        blocked_reason = f"Unknown fields: {[f.label for f in unknown_required]}"
+        log_audit(event_id, "BLOCKED_UNKNOWN_FIELD", blocked_reason, applicant_id=applicant_id)
+        update_application(event_id, applicant_id, {
             "status": "BLOCKED_UNKNOWN_FIELD",
-            "score": event.get("score", 0),
-            "score_reasoning": event.get("score_reasoning", ""),
-            "travel_support_status": event.get("travel_support", ""),
+            "questions": json.dumps([f.model_dump() for f in fields]),
+            "answers": json.dumps(answers),
             "notes": blocked_reason,
         })
-
         return {"status": "BLOCKED_UNKNOWN_FIELD", "error": blocked_reason}
 
-    # Validate the application
+    # Validate
     issues = validate_application(fields)
     if issues:
-        print(f"[agent] Application issues for {event_name}: {issues}")
+        print(f"[agent] Issues for {applicant_id} @ {event_name}: {issues}")
 
-    # Create submission snapshot
+    # LLM quality review
+    fit_score = 0
+    existing_app = get_application(event_id, applicant_id)
+    if existing_app:
+        fit_score = existing_app.get("applicant_fit_score", 0)
+
+    try:
+        quality = review_application_quality(answers, profile.data, event_context)
+        if not quality.get("passes", True):
+            print(f"[agent] Quality issues for {applicant_id}: {quality.get('issues')}")
+    except Exception as e:
+        print(f"[agent] Quality review failed: {e}")
+
+    # Create snapshot
     snapshot = create_submission_snapshot(
-        event_id=event_id,
-        event_name=event_name,
-        application_url=application_url,
-        fields=fields,
-        score=event.get("score", 0),
+        event_id=event_id, applicant_id=applicant_id,
+        event_name=event_name, application_url=application_url,
+        fields=fields, event_score=event.get("event_score", 0),
+        fit_score=fit_score,
         reason=event.get("score_reasoning", ""),
         travel_support_status=event.get("travel_support", ""),
     )
 
-    # Try to submit via browser
-    submit_result = {"status": "READY_TO_APPLY", "confirmation_text": "", "error": ""}
+    # Submit via browser
+    submit_result = {"status": "DRY_RUN_COMPLETE", "confirmation_text": "", "error": ""}
 
-    if settings.AUTO_APPLY or not settings.DRY_RUN:
+    if not settings.DRY_RUN and settings.AUTO_APPLY:
         try:
             from hackathon_searcher.browser import fill_application_form
             submit_result = fill_application_form(
                 application_url=application_url,
                 fields=fields,
-                dry_run=settings.DRY_RUN,
+                profile=profile,
+                dry_run=False,
             )
         except ImportError:
-            submit_result["error"] = "Playwright not available"
-            submit_result["status"] = "BLOCKED_LOGIN"
+            submit_result = {"status": "BLOCKED_LOGIN", "error": "Playwright not available"}
         except Exception as e:
-            submit_result["error"] = str(e)
-            submit_result["status"] = "BLOCKED_LOGIN"
+            submit_result = {"status": "BLOCKED_LOGIN", "error": str(e)}
     else:
-        submit_result["status"] = "READY_TO_APPLY"
-        submit_result["confirmation_text"] = "[Manual submit — auto apply disabled]"
+        # Dry run: simulate browser filling
+        try:
+            from hackathon_searcher.browser import fill_application_form
+            submit_result = fill_application_form(
+                application_url=application_url,
+                fields=fields,
+                profile=profile,
+                dry_run=True,
+            )
+        except ImportError:
+            submit_result["status"] = "DRY_RUN_COMPLETE"
 
-    # Store the application
+    # Update application record
     now = datetime.now(timezone.utc).isoformat()
-    insert_application({
-        "event_id": event_id,
-        "event_name": event_name,
+    update_application(event_id, applicant_id, {
         "application_url": application_url,
-        "questions": [f.model_dump() for f in fields],
-        "answers": [{"label": f.label, "answer": f.answer, "source": f.answer_source} for f in fields],
-        "date_applied": now if submit_result["status"] == "APPLIED" else "",
+        "questions": json.dumps([f.model_dump() for f in fields]),
+        "answers": json.dumps(answers),
+        "date_submitted": now if submit_result["status"] == "APPLIED" else "",
         "application_confirmation": submit_result.get("confirmation_text", ""),
-        "submission_snapshot": snapshot.model_dump(),
+        "submission_snapshot": snapshot.model_dump_json(),
         "status": submit_result["status"],
-        "score": event.get("score", 0),
-        "score_reasoning": event.get("score_reasoning", ""),
-        "travel_support_status": event.get("travel_support", ""),
         "notes": submit_result.get("error", ""),
     })
 
-    # Update event status
-    update_event(event_id, {"status": submit_result["status"]})
+    log_audit(event_id, "APPLICATION_COMPLETE",
+              f"{applicant_id}: {submit_result['status']}", applicant_id=applicant_id)
 
-    log_audit(
-        event_id,
-        "APPLICATION_COMPLETE",
-        f"Status: {submit_result['status']}, Confirmation: {submit_result.get('confirmation_text', '')[:200]}"
-    )
+    # Create application group if both applicants are applying
+    _maybe_create_group(event_id)
 
     return submit_result
 
 
-def run_single_event(event_id: str) -> dict:
-    """
-    Run the full pipeline for a single event. Useful for testing.
-    """
-    event = get_event_by_id(event_id)
-    if not event:
-        return {"error": f"Event {event_id} not found"}
+def _merge_llm_findings(event_id: str, llm_analysis: dict) -> None:
+    """Merge LLM analysis results into the event record."""
+    updates = {}
+    if llm_analysis.get("travel_support_status"):
+        updates["travel_support"] = llm_analysis["travel_support_status"]
+    if llm_analysis.get("travel_support_details"):
+        updates["travel_support_details"] = json.dumps(llm_analysis["travel_support_details"])
+    if llm_analysis.get("travel_support_amount"):
+        updates["travel_support_amount"] = llm_analysis["travel_support_amount"]
+    if llm_analysis.get("sponsors"):
+        updates["sponsors"] = json.dumps(llm_analysis["sponsors"])
+    if llm_analysis.get("themes"):
+        updates["themes"] = json.dumps(llm_analysis["themes"])
+    if llm_analysis.get("eligibility_requirements"):
+        updates["eligibility_rules_raw"] = llm_analysis["eligibility_requirements"]
+    if updates:
+        try:
+            update_event(event_id, updates)
+        except Exception as e:
+            print(f"[agent] Failed to merge LLM findings: {e}")
 
-    findings = research_event(event_id)
-    score_result = score_event(event_id)
-    app_result = process_application(event)
 
-    return {
-        "research": findings,
-        "score": score_result,
-        "application": app_result,
-    }
+def _maybe_create_group(event_id: str) -> None:
+    """Create an application group if both applicants have applications for this event."""
+    apps = get_applications_for_event(event_id)
+    applicant_ids = [a.get("applicant_id") for a in apps if a.get("applicant_id")]
+
+    if len(applicant_ids) >= 2:
+        group_id = f"grp_{event_id[:16]}_{'_'.join(sorted(applicant_ids)[:2])}"
+        create_application_group(group_id, event_id, applicant_ids)
+        for app in apps:
+            update_application(app["event_id"], app["applicant_id"], {"application_group_id": group_id})
