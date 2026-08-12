@@ -228,7 +228,8 @@ def generate_answer_for_field(
         return profile.education_text
 
     if _is_travel_support_question(question_lower):
-        return "Yes — I would be travelling from Stockholm, Sweden."
+        origin = ", ".join(part for part in (profile.city, profile.country) if part)
+        return f"Yes — I would be travelling from {origin}." if origin else "UNKNOWN_REQUIRED_FIELD"
 
     if _is_sensitive_question(question_lower):
         if field.required:

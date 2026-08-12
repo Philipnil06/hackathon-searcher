@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from hackathon_searcher import llm, scheduler
-from hackathon_searcher.onboarding import configure_llm
+from hackathon_searcher.onboarding import configure_llm, run_setup
 from hackathon_searcher.team import TeamConfig
 
 
@@ -70,6 +70,52 @@ class PublicOnboardingTests(unittest.TestCase):
                     self.assertIn(f"LLM_PROVIDER={provider}", env_text)
                     self.assertIn("LLM_MODEL=fictional-model", env_text)
                     self.assertNotIn("OPENAI_API_KEY=fictional-key", env_text)
+            finally:
+                os.chdir(original_directory)
+
+    def test_solo_setup_creates_location_and_travel_preferences_without_json_edits(self):
+        answers = [
+            "n", "Alex Builder", "", "alex@example.test", "25", "Dublin", "Ireland", "builder", "n",
+            "AI", "AI", "", "1", "1", "1", "n", "", "", "", "55",
+            "openai", "fictional-key", "fictional-model",
+        ]
+        original_directory = os.getcwd()
+        with tempfile.TemporaryDirectory() as directory:
+            try:
+                os.chdir(directory)
+                with patch.object(__import__("hackathon_searcher.onboarding", fromlist=["settings"]).settings, "PROFILES_DIR", "profiles"), \
+                     patch.object(__import__("hackathon_searcher.onboarding", fromlist=["settings"]).settings, "ANSWER_LIBRARY_DIR", "answer_library"), \
+                     patch.object(__import__("hackathon_searcher.onboarding", fromlist=["settings"]).settings, "TEAM_CONFIG_PATH", "team.json"), \
+                     patch("builtins.input", side_effect=answers):
+                    team = run_setup()
+                profile = json.loads(Path("profiles/alex_builder.json").read_text(encoding="utf-8"))
+                self.assertEqual(team.members, ("alex_builder",))
+                self.assertEqual(profile["location"], {"city": "Dublin", "country": "Ireland"})
+                self.assertEqual(profile["travel_preferences"]["scope"], "city")
+                self.assertFalse(profile["travel_preferences"]["include_remote"])
+            finally:
+                os.chdir(original_directory)
+
+    def test_team_setup_creates_two_profiles_and_local_team_config(self):
+        answers = [
+            "y", "2",
+            "Alex Builder", "", "alex@example.test", "25", "Dublin", "Ireland", "builder", "n", "AI", "AI", "", "1", "1", "1", "n", "", "", "",
+            "Sam Maker", "", "sam@example.test", "26", "Paris", "France", "designer", "n", "product", "product", "", "3", "3", "1,3", "150", "2", "n", "", "", "",
+            "55", "mistral", "fictional-key", "fictional-model",
+        ]
+        original_directory = os.getcwd()
+        with tempfile.TemporaryDirectory() as directory:
+            try:
+                os.chdir(directory)
+                with patch.object(__import__("hackathon_searcher.onboarding", fromlist=["settings"]).settings, "PROFILES_DIR", "profiles"), \
+                     patch.object(__import__("hackathon_searcher.onboarding", fromlist=["settings"]).settings, "ANSWER_LIBRARY_DIR", "answer_library"), \
+                     patch.object(__import__("hackathon_searcher.onboarding", fromlist=["settings"]).settings, "TEAM_CONFIG_PATH", "team.json"), \
+                     patch("builtins.input", side_effect=answers):
+                    team = run_setup()
+                teammate = json.loads(Path("profiles/sam_maker.json").read_text(encoding="utf-8"))
+                self.assertEqual(team.members, ("alex_builder", "sam_maker"))
+                self.assertEqual(teammate["travel_preferences"]["scope"], "region")
+                self.assertEqual(teammate["travel_preferences"]["minimum_reimbursement_eur"], 150.0)
             finally:
                 os.chdir(original_directory)
 

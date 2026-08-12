@@ -1,8 +1,8 @@
 # Hackathon Searcher
 
-**Find better hackathons. Apply faster.**
+**Find hackathons that fit where you are and what you want.**
 
-Hackathon Searcher is an AI agent that discovers hackathons, researches travel support, scores opportunities against you or your team, prepares grounded application answers, and automates the repetitive parts of applying.
+Tell Hackathon Searcher where you are, how far you are willing to travel, and what support would make a trip worthwhile. It discovers, researches, scores, and prepares applications for hackathons that fit you or your team.
 
 ```text
 Discover -> Research -> Score -> Decide -> Apply -> Track
@@ -12,7 +12,7 @@ Try it safely in about five minutes: the setup wizard creates local profiles and
 
 ## What it does
 
-- Discovers hackathons and researches deadlines, eligibility, event details, and travel support.
+- Discovers hackathons and researches deadlines, eligibility, event details, location, and any relevant travel support.
 - Scores opportunities per applicant and makes a team-first decision from the average score.
 - Requires every team member to pass hard eligibility and safety gates before an application is prepared.
 - Generates answers only from the profile facts you provide, then checks factual and cross-profile consistency.
@@ -54,7 +54,7 @@ python -m hackathon_searcher.cli preflight
 python -m hackathon_searcher.cli daily --dry-run
 ```
 
-`setup` takes roughly 3-5 minutes. A normal user does not need to edit JSON or environment variables: the wizard asks whether you are solo or a team, creates 1-4 local profiles and a team config, collects travel preferences, and configures the LLM provider, model, and API key. Keys are saved only in the ignored local `.env` file.
+`setup` takes roughly 3-5 minutes. A normal user does not need to edit JSON or environment variables: the wizard asks whether you are solo or a team, creates 1-4 local profiles and a team config, collects your location and travel preferences, and configures the LLM provider, model, and API key. Keys are saved only in the ignored local `.env` file.
 
 `preflight` validates profiles, the team, database, LLM configuration, key paths, and optional browser/scheduler status. It does not contact an LLM and never submits. `daily --dry-run` discovers and prepares opportunities while forcing submission off.
 
@@ -84,6 +84,21 @@ python -m hackathon_searcher.cli team remove <applicant_id>
 ```
 
 Use `profile improve` later to add projects, work and startup experience, hackathon experience, awards, verified metrics, skills, communities, facts allowed in applications, and facts that must not be referenced.
+
+## Location and travel preferences
+
+Each applicant controls their own local, profile-based preferences. Choose a scope of **your city**, **your country**, **Europe** (the currently supported region), or **anywhere**. You can include or exclude remote events independently.
+
+Travel support is separate from location: choose **not important**, **preferred**, or **required**. If it matters, choose accepted types—flight credits, train credits, reimbursement, accommodation, or any support—and optionally set a minimum reimbursement in EUR. Accommodation also has its own not-important/preferred/required setting.
+
+For example, the fictional templates demonstrate both models:
+
+- `profiles/example_builder.json`: a city-only applicant who does not require travel support.
+- `profiles/example_teammate.json`: a Europe-wide applicant who requires verified flights or reimbursement of at least EUR 150, while preferring accommodation.
+
+Location compatibility is checked before costly research. Required support must be explicitly verified and match the accepted type and minimum amount; unknown or insufficient required support never reaches automatic application. Preferred support improves ranking but never turns an otherwise suitable event into an ineligible one.
+
+For a team, discovery uses the first configured member as the cheap initial location preference. Before an event can be prepared or submitted, **every member** must independently satisfy their location, travel-support, and accommodation requirements as well as the existing safety gates.
 
 ## LLM providers
 
@@ -152,7 +167,7 @@ The public repository contains source code, fictional examples, templates, tests
 
 ## Configuration
 
-`setup` is the recommended route. Advanced users can inspect `.env.example`, `team.example.json`, and the fictional examples in `profiles/` and `answer_library/`, but manual JSON editing is not needed for normal onboarding.
+`setup` is the recommended route. Advanced users can inspect `.env.example`, `team.example.json`, and the fictional examples in `profiles/` and `answer_library/`, but manual JSON editing is not needed for normal onboarding. Location and travel preference data is stored under `location` and `travel_preferences` in each local profile; older profiles with the previous travel fields continue to work safely.
 
 New configurations default to `DRY_RUN=true`, `AUTO_APPLY=false`, and `LIVE_TEST_MODE=false`.
 

@@ -631,7 +631,11 @@ def prepare_ready_to_apply(preflight: bool = False, event_ids: set[str] | None =
                 "eligibility_source_evidence": fit.get("eligibility_source_evidence", ""),
                 "eligibility_requirements": fit.get("eligibility_requirements", []),
                 "travel_eligible": 1 if fit.get("travel_eligible") else 0,
-                "travel_support_requested": 1,
+                "travel_support_requested": 0 if fit.get("travel_requirement_status") == "NOT_REQUIRED" else 1,
+                "location_fit_score": fit.get("location_fit", 0),
+                "location_status": fit.get("location_status", ""),
+                "travel_requirement_status": fit.get("travel_requirement_status", ""),
+                "accommodation_requirement_status": fit.get("accommodation_requirement_status", ""),
                 "travel_support_status": final_travel,
                 "duplicate_check_passed": 1 if not (existing and existing.get("status") in {"APPLIED", *UNCERTAIN_SUBMISSION_STATUSES}) else 0,
             }
@@ -642,6 +646,15 @@ def prepare_ready_to_apply(preflight: bool = False, event_ids: set[str] | None =
             if eligibility not in LIVE_ELIGIBLE_STATES or not fit.get("eligible", False):
                 status = "BLOCKED_ELIGIBILITY_UNCERTAIN" if eligibility.startswith("UNCERTAIN") else "INELIGIBLE"
                 _update_blocked_application(event["event_id"], applicant_id, status, base["eligibility_reasoning"] or status)
+                continue
+            if not fit.get("location_allowed", False):
+                _update_blocked_application(event["event_id"], applicant_id, "BLOCKED_LOCATION", fit.get("location_reasoning", "Outside configured travel scope"))
+                continue
+            if not fit.get("travel_requirement_met", False):
+                _update_blocked_application(event["event_id"], applicant_id, "BLOCKED_TRAVEL_SUPPORT", fit.get("travel_reasoning", "Required travel support is not verified"))
+                continue
+            if not fit.get("accommodation_requirement_met", False):
+                _update_blocked_application(event["event_id"], applicant_id, "BLOCKED_ACCOMMODATION", fit.get("accommodation_reasoning", "Required accommodation is not verified"))
                 continue
 
             stored_status = str(existing.get("discovery_status", "") or "") if existing else ""
@@ -1148,6 +1161,16 @@ def validate_live_eligibility(event_id: str, applicant_id: str) -> dict[str, Any
     checks["eligible"] = fit.get("eligible", False) and fit.get("eligibility_status") in LIVE_ELIGIBLE_STATES
     if not checks["eligible"]:
         blockers.append(f"Not eligible: {fit.get('eligibility_reasoning', 'Unknown')}")
+
+    checks["location_allowed"] = bool(fit.get("location_allowed"))
+    if not checks["location_allowed"]:
+        blockers.append(f"Location requirement not met: {fit.get('location_reasoning', 'Unknown')}")
+    checks["travel_requirement_met"] = bool(fit.get("travel_requirement_met"))
+    if not checks["travel_requirement_met"]:
+        blockers.append(f"Travel support requirement not met: {fit.get('travel_reasoning', 'Unknown')}")
+    checks["accommodation_requirement_met"] = bool(fit.get("accommodation_requirement_met"))
+    if not checks["accommodation_requirement_met"]:
+        blockers.append(f"Accommodation requirement not met: {fit.get('accommodation_reasoning', 'Unknown')}")
 
     checks["schedule_conflict"] = event.get("status") != "SCHEDULE_CONFLICT"
     if not checks["schedule_conflict"]:

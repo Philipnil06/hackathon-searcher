@@ -39,6 +39,8 @@ from hackathon_searcher.profile import profile_manager
 from hackathon_searcher.scoring import score_event, score_applicant_fit
 from hackathon_searcher.scraper import discover_events, process_discovered_events
 from hackathon_searcher.settings import settings
+from hackathon_searcher.team import load_team
+from hackathon_searcher.travel import assess_accommodation, assess_location, assess_travel_support
 
 # === CONSTANTS ===
 
@@ -59,9 +61,6 @@ THEMATIC_KEYWORDS = {
     "edtech": 12, "consumer": 11, "startup": 12, "founder": 12,
     "space": 12, "biotech": 11, "gaming": 9, "health": 10,
 }
-
-# Countries close to Stockholm
-CLOSE_COUNTRIES = {"SE", "DK", "NO", "FI", "DE", "NL", "BE", "GB", "PL", "EE", "LV", "LT"}
 
 # Strong sponsor patterns
 STRONG_SPONSOR_PATTERNS = [
@@ -103,49 +102,30 @@ def stage1_score(event: dict) -> tuple[bool, int, str]:
     score = 0
     reasons = []
 
-    travel = event.get("travel_support", "")
+    # Location comes first. The first configured team member determines cheap
+    # discovery priority; final preparation still enforces every member's
+    # profile, so no team application can bypass a member-level hard gate.
+    primary = _primary_profile()
+    if primary:
+        location = assess_location(event, primary)
+        if not location["allowed"]:
+            return False, 0, f"location:{location['status']}"
+        score += int(location["fit"] * 3)
+        reasons.append(f"location:{location['status']}")
 
-    # === MUST-RESEARCH triggers (bypass cap) ===
-    if "CONFIRMED_FLIGHTS" in travel:
-        score += 100
-        reasons.append("CONFIRMED_FLIGHTS")
-    elif "CONFIRMED_TRAVEL_REIMBURSEMENT" in travel:
-        score += 95
-        reasons.append("CONFIRMED_TRAVEL_REIMBURSEMENT")
-    elif "CONFIRMED_TRAVEL_STIPEND" in travel:
-        score += 90
-        reasons.append("CONFIRMED_TRAVEL_STIPEND")
-    elif "CONFIRMED_ACCOMMODATION" in travel:
-        score += 80
-        reasons.append("ACCOMMODATION")
-
-    # Travel probability
-    ts_prob_raw = event.get("travel_support_probability", 0)
-    try:
-        ts_prob = float(ts_prob_raw) if ts_prob_raw else 0.0
-    except (ValueError, TypeError):
-        ts_prob = 0.0
-    if ts_prob > 0.5:
-        score += int(ts_prob * 20)
-        reasons.append(f"travel_prob={ts_prob:.0%}")
-
-    # Accommodation
-    if str(event.get("accommodation", "")).lower() == "yes":
-        score += 30
-        reasons.append("accommodation")
-
-    # === Location ===
-    country = (event.get("country") or "").upper()
-    city = (event.get("city") or "").lower()
-    is_local = country == "SE" or city in ("stockholm", "uppsala", "malmö", "göteborg", "gothenburg")
-    is_close = country in CLOSE_COUNTRIES
-
-    if is_local:
-        score += 50
-        reasons.append("local")
-    elif is_close:
-        score += 15
-        reasons.append("close")
+        travel = assess_travel_support(event, primary)
+        accommodation = assess_accommodation(event, primary)
+        # Reject only deterministic failures. Unknown required support is
+        # researched, then remains blocked until verified before application.
+        if travel["status"] in {"UNSUPPORTED_REQUIRED", "BELOW_MINIMUM"}:
+            return False, 0, f"travel:{travel['status']}"
+        if not accommodation["meets_requirement"]:
+            return False, 0, f"accommodation:{accommodation['status']}"
+        if travel["useful"]:
+            score += 10
+            reasons.append(f"travel:{travel['status']}")
+        elif travel["status"] == "UNKNOWN_REQUIRED":
+            reasons.append("travel:research_required")
 
     # === Thematic scoring ===
     name_desc = (event.get("event_name", "") + " " + (event.get("description", "") or "")).lower()
@@ -221,10 +201,12 @@ def stage1_score(event: dict) -> tuple[bool, int, str]:
 def _cheap_pre_fit(event: dict, applicant_id: str, combined_text: str) -> int:
     """Cheap deterministic pre-fit score for one applicant. Returns 0-30."""
     score = 0
-    country = (event.get("country") or "").upper()
-    is_close = country in CLOSE_COUNTRIES
-
     profile = profile_manager.get(applicant_id)
+    if not profile:
+        return 0
+    location = assess_location(event, profile)
+    if not location["allowed"]:
+        return 0
     interests = {str(item).lower() for item in (profile.interests if profile else [])}
     skills = {str(item).lower() for item in (profile.skills if profile else [])}
     for keyword in interests | skills:
@@ -238,11 +220,24 @@ def _cheap_pre_fit(event: dict, applicant_id: str, combined_text: str) -> int:
             score += 3
             break
 
-    # Location bonus
-    if is_close:
-        score += 3
+    # Location is deterministic and outweighs a coincidental keyword match at
+    # this inexpensive filtering stage.
+    score += int(location["fit"] * 0.5)
 
     return min(score, 30)
+
+
+def _primary_profile():
+    """Return the profile used for deterministic discovery prioritization."""
+    try:
+        team = load_team()
+        if team.members:
+            profile = profile_manager.get(team.members[0])
+            if profile:
+                return profile
+    except (OSError, ValueError, json.JSONDecodeError):
+        pass
+    return profile_manager.all_profiles[0] if profile_manager.all_profiles else None
 
 
 # === DEADLINE URGENCY ===
@@ -278,16 +273,14 @@ def deadline_urgency(event: dict) -> tuple[int, str]:
 
 def rank_events_for_research(events: list[dict]) -> list[dict]:
     """
-    Rank events for Stage 2 research by priority:
-    1. NEW + confirmed travel
-    2. NEW + very high relevance
-    3. UPDATED with travel change
-    4. Urgent deadlines
-    5. Score
+    Rank only location-compatible Stage 1 candidates for Stage 2 research.
+    Newness, deadline and deterministic profile fit decide the order.
     """
     scored = []
     for event in events:
         should, priority_score, reason = stage1_score(event)
+        if not should:
+            continue
 
         # Boost for NEW events
         is_new = event.get("status") == "DISCOVERED"
@@ -311,16 +304,6 @@ def rank_events_for_research(events: list[dict]) -> list[dict]:
 
 def is_mandatory_research(event: dict) -> bool:
     """Check if an event MUST be researched regardless of cap. Keep tight."""
-    travel = event.get("travel_support", "")
-    # Only confirmed flights/travel reimbursement bypass the cap (not just accommodation or stipend)
-    if travel in ("CONFIRMED_FLIGHTS", "CONFIRMED_TRAVEL_REIMBURSEMENT"):
-        return True
-
-    country = (event.get("country") or "").upper()
-    city = (event.get("city") or "").lower()
-    if country == "SE" or city in ("stockholm", "uppsala", "malmö", "göteborg", "gothenburg"):
-        return True
-
     combined = (event.get("event_name", "") + " " + (event.get("description", "") or "")).lower()
     for kw in MANDATORY_RESEARCH_KEYWORDS:
         if kw in combined:

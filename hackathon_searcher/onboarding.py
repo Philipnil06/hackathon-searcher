@@ -9,6 +9,7 @@ from pathlib import Path
 from hackathon_searcher.profile import profile_manager
 from hackathon_searcher.settings import settings
 from hackathon_searcher.team import MAX_TEAM_SIZE, TeamConfig, save_team
+from hackathon_searcher.travel import SUPPORT_TYPES
 
 
 def _ask(label: str, default: str = "", required: bool = False) -> str:
@@ -33,6 +34,62 @@ def _items(label: str, limit: int = 0) -> list[str]:
     value = _ask(label)
     values = [item.strip() for item in value.split(",") if item.strip()]
     return values[:limit] if limit else values
+
+
+def _choose(label: str, options: dict[str, str], default: str, display: dict[str, str] | None = None) -> str:
+    """Prompt with numbered choices while accepting the canonical value too."""
+    print(label)
+    for number, value in options.items():
+        print(f"  {number}. {(display or {}).get(value, value.replace('_', ' '))}")
+    values = {value: value for value in options.values()} | options
+    while True:
+        answer = _ask("Choice", default).lower().replace(" ", "_")
+        if answer in values:
+            return values[answer]
+        print("Choose one of: " + ", ".join(options))
+
+
+def _travel_preferences() -> dict:
+    scope = _choose("How far are you willing to travel for hackathons?", {
+        "1": "city", "2": "country", "3": "region", "4": "anywhere",
+    }, "3", {
+        "city": "My city only", "country": "Anywhere in my country",
+        "region": "My region / Europe", "anywhere": "Anywhere",
+    })
+    support = _choose("How important is travel support?", {
+        "1": "not_important", "2": "preferred", "3": "required",
+    }, "2")
+    accepted: list[str] = []
+    minimum: float | None = None
+    if support != "not_important":
+        print("Which travel support works for you? Enter numbers separated by commas.")
+        labels = {
+            "1": "flight_credits", "2": "train_credits", "3": "travel_reimbursement",
+            "4": "accommodation", "5": "any_travel_support",
+        }
+        for number, value in labels.items():
+            print(f"  {number}. {value.replace('_', ' ')}")
+        while not accepted:
+            choices = _items("Choices", 4)
+            accepted = [labels.get(choice.strip(), choice.strip().lower().replace(" ", "_")) for choice in choices]
+            accepted = [choice for choice in accepted if choice in SUPPORT_TYPES]
+            if not accepted:
+                print("Choose at least one accepted transport support type.")
+        minimum_text = _ask("Minimum useful reimbursement in EUR (optional)")
+        if minimum_text:
+            try:
+                minimum = max(0.0, float(minimum_text.replace("€", "").replace(",", ".").strip()))
+            except ValueError:
+                print("Ignoring invalid minimum reimbursement; you can add it later with profile improve.")
+    accommodation = _choose("How important is accommodation?", {
+        "1": "not_important", "2": "preferred", "3": "required",
+    }, "1")
+    include_remote = _yes_no("Include remote/online hackathons?", default=True)
+    return {
+        "scope": scope, "region": "europe", "travel_support": support,
+        "accepted_support": accepted, "minimum_reimbursement_eur": minimum,
+        "accommodation": accommodation, "include_remote": include_remote,
+    }
 
 
 def _slug(value: str) -> str:
@@ -77,21 +134,23 @@ def collect_profile(index: int) -> dict:
         if not project:
             break
         projects.append({"name": project, "description": _ask("  Short description"), "role": role})
-    regions = _items("Travel regions you can attend (comma-separated, e.g. Europe)")
-    travel = _ask("Travel support: required / preferred / not_required", "preferred").lower()
-    if travel not in {"required", "preferred", "not_required"}:
-        travel = "preferred"
+    travel_preferences = _travel_preferences()
     return {
         "schema_version": 2, "applicant_id": applicant_id, "full_name": full_name, "name": full_name,
         "email": email, "age": int(age_text), "location": {"city": city, "country": country},
         "home_city": city, "home_country": country, "travel_origin": city,
         "employment_status": role, "education": {"school": education, "current_student": is_student},
         "interests": interests, "preferred_hackathon_topics": topics, "projects": projects,
-        "travel_regions": regions, "travel_support_preference": travel,
-        "travel_support_wanted": travel != "not_required", "skills": [],
+        "travel_preferences": travel_preferences,
+        # Legacy mirrors make old integrations safe while new code reads the
+        # structured travel_preferences object.
+        "travel_regions": ["Europe"] if travel_preferences["scope"] == "region" else [],
+        "travel_support_preference": travel_preferences["travel_support"],
+        "travel_support_wanted": travel_preferences["travel_support"] != "not_important", "skills": [],
         "linkedin": _ask("LinkedIn URL (optional)"), "github": _ask("GitHub URL (optional)"),
         "website": _ask("Website URL (optional)"), "portfolio": "",
-        "consent": {"auto_apply": False, "share_personal_info": False, "request_travel_support": travel != "not_required"},
+        "consent": {"auto_apply": False, "share_personal_info": False,
+                    "request_travel_support": travel_preferences["travel_support"] != "not_important"},
         "availability": {"weekends": True, "weekdays": False, "can_attend_full_event_duration": True},
     }
 
@@ -164,6 +223,11 @@ def improve_profile(applicant_id: str) -> dict:
             data[key] = values
     if facts := _items("Facts or topics you do not want used (comma-separated)"):
         data["do_not_use_facts"] = facts
+    if _yes_no("Update travel and remote preferences?"):
+        preferences = _travel_preferences()
+        data["travel_preferences"] = preferences
+        data["travel_support_preference"] = preferences["travel_support"]
+        data["travel_support_wanted"] = preferences["travel_support"] != "not_important"
     _write_profile(data)
     profile_manager.reload()
     return data
@@ -179,4 +243,7 @@ def validate_profile(applicant_id: str) -> list[str]:
         issues.append("Application email must contain @")
     if profile.age and not 1 <= profile.age <= 120:
         issues.append("Age must be between 1 and 120")
+    preferences = profile.data.get("travel_preferences")
+    if preferences is not None and not isinstance(preferences, dict):
+        issues.append("Travel preferences must be an object")
     return issues

@@ -16,6 +16,7 @@ from hackathon_searcher.models import TravelSupportStatus
 from hackathon_searcher.profile import profile_manager, ApplicantProfile
 from hackathon_searcher.settings import settings
 from hackathon_searcher.llm import classify_sponsor_quality, classify_themes, interpret_eligibility
+from hackathon_searcher.travel import assess_accommodation, assess_location, assess_travel_support
 
 # Known strong sponsors (Tier scoring reference)
 KNOWN_STRONG_SPONSORS = {
@@ -76,12 +77,12 @@ def score_event(event_id: str) -> dict:
 
     total = round(travel_score + sponsor_score + tech_score + event_quality_score + prize_score + logistics_score, 1)
 
-    reasoning = f"""Travel: {travel_score}/40 - {travel_reason}
+    reasoning = f"""Travel: {travel_score}/15 - {travel_reason}
 Sponsors: {sponsor_score}/20 - {sponsor_reason}
-Tech relevance: {tech_score}/15 - {tech_reason}
-Event quality: {event_quality_score}/10 - {event_quality_reason}
-Prizes: {prize_score}/10 - {prize_reason}
-Logistics: {logistics_score}/5 - {logistics_reason}
+Tech relevance: {tech_score}/25 - {tech_reason}
+Event quality: {event_quality_score}/15 - {event_quality_reason}
+Prizes: {prize_score}/15 - {prize_reason}
+Logistics: {logistics_score}/10 - {logistics_reason}
 Total event score: {total}/100"""
 
     updates = {
@@ -129,11 +130,13 @@ def score_applicant_fit(event_id: str, applicant_id: str) -> dict:
     if not profile:
         return {"error": f"Applicant {applicant_id} not found"}
 
-    # --- Eligibility ---
+    # Deterministic location/support checks run before form work or ambiguous
+    # research. They keep simple geographic decisions cheap and transparent.
+    location = assess_location(event, profile)
+    travel = assess_travel_support(event, profile)
+    accommodation = assess_accommodation(event, profile)
     eligibility = _assess_eligibility(event, profile)
-
-    # --- Travel eligibility ---
-    travel_eligible = _assess_travel_eligibility(event, profile)
+    travel_eligible = bool(travel["meets_requirement"])
 
     # --- Fit scoring ---
     # Tech alignment: how well do the applicant's interests/skills match the event themes?
@@ -153,18 +156,19 @@ def score_applicant_fit(event_id: str, applicant_id: str) -> dict:
     project_fit = _score_project_relevance(profile, themes, description)  # 0-25
     experience_fit = _score_experience_relevance(profile, event)  # 0-20
     event_type_fit = _score_event_type_fit(profile, event)  # 0-15
-    travel_fit = _score_travel_fit(profile, event, travel_eligible)  # 0-10
+    location_fit = float(location["fit"])
+    travel_fit = min(10.0, float(travel["fit"]) * 0.8 + float(accommodation["fit"]) * 0.7)
 
-    fit_score = round(tech_fit + project_fit + experience_fit + event_type_fit + travel_fit, 1)
+    fit_score = round(min(100.0, tech_fit + project_fit + experience_fit + event_type_fit + location_fit + travel_fit), 1)
 
     # Should apply?
     event_score = event.get("event_score", 0)
     should_apply, apply_reason = _should_apply_for_applicant(
-        event_score, fit_score, eligibility, travel_eligible, event
+        event_score, fit_score, eligibility, location, travel, accommodation, event
     )
 
     event_components = score_event(event_id).get("breakdown", {})
-    apply_score, apply_breakdown = calculate_apply_score(event, fit_score, event_components)
+    apply_score, apply_breakdown = calculate_apply_score(event, fit_score, event_components, location, travel, accommodation)
     result = {
         "applicant_id": applicant_id,
         "fit_score": fit_score,
@@ -175,6 +179,16 @@ def score_applicant_fit(event_id: str, applicant_id: str) -> dict:
         "eligibility_source_evidence": eligibility.get("source_evidence", ""),
         "eligibility_requirements": eligibility.get("requirements", eligibility.get("concerns", [])),
         "travel_eligible": travel_eligible,
+        "location_allowed": bool(location["allowed"]),
+        "location_status": location["status"],
+        "location_reasoning": location["reason"],
+        "location_fit": location_fit,
+        "travel_requirement_met": bool(travel["meets_requirement"]),
+        "travel_requirement_status": travel["status"],
+        "travel_reasoning": travel["reason"],
+        "accommodation_requirement_met": bool(accommodation["meets_requirement"]),
+        "accommodation_requirement_status": accommodation["status"],
+        "accommodation_reasoning": accommodation["reason"],
         "should_apply": should_apply,
         "apply_reason": apply_reason,
         "apply_score": apply_score,
@@ -184,6 +198,7 @@ def score_applicant_fit(event_id: str, applicant_id: str) -> dict:
             "project_fit": project_fit,
             "experience_fit": experience_fit,
             "event_type_fit": event_type_fit,
+            "location_fit": location_fit,
             "travel_fit": travel_fit,
         }
     }
@@ -199,23 +214,37 @@ def score_applicant_fit(event_id: str, applicant_id: str) -> dict:
             "eligibility_source_evidence": result["eligibility_source_evidence"],
             "eligibility_requirements": result["eligibility_requirements"],
             "travel_eligible": 1 if travel_eligible else 0,
+            "location_fit_score": location_fit,
+            "location_status": location["status"],
+            "travel_requirement_status": travel["status"],
+            "accommodation_requirement_status": accommodation["status"],
             "travel_score": event_components.get("travel", 0.0),
             "apply_score": apply_score,
         })
     return result
 
 
-def calculate_apply_score(event: dict, fit_score: float, components: dict[str, float]) -> tuple[float, dict[str, float]]:
-    """Rank applications without treating missing travel/sponsor data as a penalty."""
-    status = str(event.get("official_travel_status") or event.get("travel_support") or "UNKNOWN")
-    confirmed = {"CONFIRMED_FLIGHTS", "CONFIRMED_TRAVEL_REIMBURSEMENT", "CONFIRMED_TRAVEL_STIPEND"}
-    travel_value = 20.0 if status in confirmed else 10.0 if status in {"NO_TRAVEL_INFORMATION", "UNKNOWN", ""} else 6.0
+def calculate_apply_score(
+    event: dict,
+    fit_score: float,
+    components: dict[str, float],
+    location: dict | None = None,
+    travel: dict | None = None,
+    accommodation: dict | None = None,
+) -> tuple[float, dict[str, float]]:
+    """Rank applications with location first and travel as one preference signal."""
+    location, travel, accommodation = location or {}, travel or {}, accommodation or {}
+    location_value = round(min(12.0, float(location.get("fit", 5.0)) * 1.2), 1)
+    travel_value = round(min(10.0, float(travel.get("fit", 5.0))), 1)
+    accommodation_value = round(min(3.0, float(accommodation.get("fit", 0.0))), 1)
     opportunity = min(10.0, float(components.get("prizes_opportunity", 0)) + float(components.get("sponsors", 0)) * 0.25)
     deadline = 2.0 if not event.get("application_deadline") else 3.0
     breakdown = {
-        "applicant_fit": round(fit_score * 0.35, 1),
+        "applicant_fit": round(fit_score * 0.30, 1),
         "event_quality_relevance": round(min(25.0, float(components.get("technical_relevance", 0)) + float(components.get("event_quality", 0))), 1),
+        "location_value": location_value,
         "travel_value": travel_value,
+        "accommodation_value": accommodation_value,
         "opportunity": round(opportunity, 1),
         "logistics": round(min(5.0, float(components.get("logistics", 0))), 1),
         "deadline_urgency": deadline,
@@ -420,58 +449,28 @@ def _score_event_type_fit(profile: ApplicantProfile, event: dict) -> float:
     return min(max(score, 0), 15)
 
 
-def _score_travel_fit(profile: ApplicantProfile, event: dict, travel_eligible: bool) -> float:
-    """Score 0-10 based on travel logistics for this applicant."""
-    score = 5.0
-
-    if travel_eligible:
-        score += 3.0
-
-    # Applicant wants travel support
-    if profile.travel_support_wanted:
-        score += 1.0
-
-    # Event is in Europe (easier from Stockholm)
-    country = event.get("country", "").lower()
-    european_countries = {
-        "sweden", "se", "denmark", "dk", "norway", "no", "finland", "fi",
-        "germany", "de", "uk", "united kingdom", "netherlands", "nl",
-        "belgium", "be", "france", "fr", "austria", "at", "switzerland", "ch",
-        "poland", "pl", "italy", "it", "spain", "es", "portugal", "pt",
-        "ireland", "ie", "estonia", "ee", "latvia", "lv", "lithuania", "lt",
-        "czech", "cz", "hungary", "hu", "romania", "ro"
-    }
-    if country in european_countries:
-        score += 1.0
-
-    return min(score, 10)
-
-
 def _should_apply_for_applicant(
     event_score: float,
     fit_score: float,
     eligibility: dict,
-    travel_eligible: bool,
+    location: dict,
+    travel: dict,
+    accommodation: dict,
     event: dict,
 ) -> tuple[bool, str]:
     """Determine if a specific applicant should apply."""
     if not eligibility.get("eligible", False):
         return False, f"Not eligible: {eligibility.get('reasoning', 'Unknown')}"
-
-    # Confirmed flights override
-    ts = event.get("travel_support", "")
-    if ts in ("CONFIRMED_FLIGHTS", "CONFIRMED_TRAVEL_REIMBURSEMENT", "CONFIRMED_TRAVEL_STIPEND"):
-        if travel_eligible:
-            return True, "Confirmed travel support — automatic apply"
-
+    if not location.get("allowed"):
+        return False, f"Location does not fit: {location.get('reason', 'Unknown')}"
+    if not travel.get("meets_requirement"):
+        return False, f"Travel requirement not met: {travel.get('reason', 'Unknown')}"
+    if not accommodation.get("meets_requirement"):
+        return False, f"Accommodation requirement not met: {accommodation.get('reason', 'Unknown')}"
     combined = (event_score + fit_score) / 2
 
     if combined >= settings.MIN_APPLICATION_SCORE:
         return True, f"Combined score {combined:.0f} >= {settings.MIN_APPLICATION_SCORE}"
-
-    if combined >= 40:
-        if travel_eligible:
-            return True, "Score 40-54 with travel eligibility"
 
     return False, f"Combined score too low ({combined:.0f})"
 
@@ -483,12 +482,12 @@ def _score_travel(event: dict) -> tuple[float, str]:
     confidence = float(event.get("travel_support_confidence", 0))
 
     status_map = {
-        TravelSupportStatus.CONFIRMED_FLIGHTS.value: (40, "Flights confirmed"),
-        TravelSupportStatus.CONFIRMED_TRAVEL_REIMBURSEMENT.value: (38, "Travel reimbursement confirmed"),
-        TravelSupportStatus.CONFIRMED_TRAVEL_STIPEND.value: (32, "Travel stipend confirmed"),
-        TravelSupportStatus.CONFIRMED_ACCOMMODATION_ONLY.value: (10, "Accommodation only"),
-        TravelSupportStatus.TRAVEL_SUPPORT_MENTIONED.value: (25, "Travel support mentioned"),
-        TravelSupportStatus.POSSIBLE_TRAVEL_SUPPORT.value: (18, "Possible travel support"),
+        TravelSupportStatus.CONFIRMED_FLIGHTS.value: (15, "Flights confirmed"),
+        TravelSupportStatus.CONFIRMED_TRAVEL_REIMBURSEMENT.value: (14, "Travel reimbursement confirmed"),
+        TravelSupportStatus.CONFIRMED_TRAVEL_STIPEND.value: (12, "Travel stipend confirmed"),
+        TravelSupportStatus.CONFIRMED_ACCOMMODATION_ONLY.value: (4, "Accommodation only"),
+        TravelSupportStatus.TRAVEL_SUPPORT_MENTIONED.value: (8, "Travel support mentioned"),
+        TravelSupportStatus.POSSIBLE_TRAVEL_SUPPORT.value: (5, "Possible travel support"),
         TravelSupportStatus.NO_TRAVEL_INFORMATION.value: (0, "No travel info"),
         TravelSupportStatus.NO_TRAVEL_SUPPORT.value: (0, "No travel support"),
         TravelSupportStatus.UNKNOWN.value: (0, "Unknown"),
@@ -550,7 +549,7 @@ def _score_technical_relevance(event: dict) -> tuple[float, str]:
             max_score = max(max_score, score)
             matched.append(theme)
 
-    final = min(max_score + len(matched) * 0.5, 15)
+    final = min(max_score + len(matched) * 0.5, 25)
     return round(final, 1), f"Themes: {', '.join(matched[:5])}" if matched else "No themes identified"
 
 
@@ -572,7 +571,7 @@ def _score_event_quality(event: dict) -> tuple[float, str]:
         score += 2.0
     elif p_type == "hybrid":
         score += 1.0
-    return round(min(score, 10), 1), f"Organizer: {'yes' if event.get('organizer') else 'no'}"
+    return round(min(score, 15), 1), f"Organizer: {'yes' if event.get('organizer') else 'no'}"
 
 
 def _score_prizes(event: dict) -> tuple[float, str]:
@@ -590,37 +589,22 @@ def _score_prizes(event: dict) -> tuple[float, str]:
         score += 2.0
     if re.search(r'credits?|hardware|gpu', prizes_text):
         score += 1.0
-    return round(min(score, 10), 1), "Has prizes" if prizes else "No prizes listed"
+    return round(min(score, 15), 1), "Has prizes" if prizes else "No prizes listed"
 
 
 def _score_logistics(event: dict) -> tuple[float, str]:
-    score = 3.0
-    city = event.get("city", "").lower()
-    country = event.get("country", "").lower()
-
-    if city == "stockholm" or "stockholm" in city:
-        score = 5.0
-    elif country in ("sweden", "se"):
-        score = 5.0
-    elif country in ("denmark", "dk", "norway", "no", "finland", "fi"):
-        score = 4.5
-    elif country in ("germany", "de", "uk", "united kingdom", "netherlands", "nl", "belgium", "be"):
-        score = 4.0
-    elif country in ("france", "fr", "austria", "at", "switzerland", "ch", "poland", "pl",
-                     "italy", "it", "spain", "es", "portugal", "pt", "ireland", "ie",
-                     "estonia", "ee", "latvia", "lv", "lithuania", "lt",
-                     "czech", "cz", "hungary", "hu", "romania", "ro"):
-        score = 3.5
-    else:
-        score = 2.0
-
+    """Event-level completeness only; applicant location is scored separately."""
+    score = 2.0
+    if event.get("city") and event.get("country"):
+        score += 3.0
+    if event.get("venue"):
+        score += 1.0
+    if event.get("start_date") and event.get("end_date"):
+        score += 2.0
     p_type = event.get("physical_or_online", "").lower()
-    if p_type in ("physical", "in-person", "in person"):
-        score = min(score + 0.5, 5.0)
-    elif p_type == "online":
-        score -= 1.0
-
-    return round(max(score, 0), 1), f"Location: {city or 'unknown'}"
+    if p_type in ("physical", "in-person", "in person", "hybrid", "online"):
+        score += 1.0
+    return round(min(score, 10.0), 1), "Event logistics completeness"
 
 
 def score_all_events() -> list[dict]:

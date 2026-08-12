@@ -5,6 +5,15 @@
   "phone": "+46 70 000 00 01",
   "location": {"city": "Stockholm", "country": "Sweden"},
   "travel_origin": "Stockholm",
+  "travel_preferences": {
+    "scope": "region",
+    "region": "europe",
+    "travel_support": "required",
+    "accepted_support": ["flight_credits", "travel_reimbursement"],
+    "minimum_reimbursement_eur": 150,
+    "accommodation": "preferred",
+    "include_remote": false
+  },
   "travel_support_wanted": true,
   "linkedin": "https://linkedin.com/in/sam-teammate",
   "github": "https://github.com/example",

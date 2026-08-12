@@ -5,7 +5,16 @@
   "phone": "+46 70 000 00 00",
   "location": {"city": "Stockholm", "country": "Sweden"},
   "travel_origin": "Stockholm",
-  "travel_support_wanted": true,
+  "travel_preferences": {
+    "scope": "city",
+    "region": "europe",
+    "travel_support": "not_important",
+    "accepted_support": [],
+    "minimum_reimbursement_eur": null,
+    "accommodation": "not_important",
+    "include_remote": false
+  },
+  "travel_support_wanted": false,
   "age": 25,
   "linkedin": "https://linkedin.com/in/alex-builder",
   "github": "https://github.com/example",
@@ -20,6 +29,6 @@
   "accessibility_requirements": "None",
   "employment_status": "self-employed",
   "team": {"default_partner": "teammate"},
-  "consent": {"auto_apply": false, "share_personal_info": false, "request_travel_support": true},
+  "consent": {"auto_apply": false, "share_personal_info": false, "request_travel_support": false},
   "availability": {"weekends": true, "weekdays": false, "can_attend_full_event_duration": true}
 }

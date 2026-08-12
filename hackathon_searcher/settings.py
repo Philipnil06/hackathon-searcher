@@ -54,8 +54,9 @@ class Settings:
     CRAWL_INTERVAL_HOURS: int = int(os.getenv("CRAWL_INTERVAL_HOURS", "24"))
 
     # --- Geography ---
-    HOME_CITY: str = os.getenv("HOME_CITY", "Stockholm")
-    HOME_COUNTRY: str = os.getenv("HOME_COUNTRY", "Sweden")
+    # Legacy global values; runtime location preferences are profile-specific.
+    HOME_CITY: str = os.getenv("HOME_CITY", "")
+    HOME_COUNTRY: str = os.getenv("HOME_COUNTRY", "")
     PREFER_PHYSICAL_EVENTS: bool = os.getenv("PREFER_PHYSICAL_EVENTS", "true").lower() == "true"
     PREFERRED_REGIONS: list[str] = field(default_factory=lambda: ["Europe"])
 
