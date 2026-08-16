@@ -24,7 +24,7 @@ from hackathon_searcher.dashboard import (
 from hackathon_searcher.agent import run_daily_pipeline
 from hackathon_searcher.daily import run_daily_pipeline as run_efficient_daily, run_current_data_preflight
 from hackathon_searcher.live_submit import run_targeted_application_discovery, prepare_ready_to_apply, select_targeted_event_ids, validate_luma_form_fill
-from hackathon_searcher.database import get_application, get_event_by_id
+from hackathon_searcher.database import get_application, get_event_by_id, get_llm_usage_summary
 from hackathon_searcher.profile import profile_manager
 from hackathon_searcher.auth import run_auth_setup, print_auth_status
 from hackathon_searcher.human_assist import (
@@ -40,6 +40,15 @@ from hackathon_searcher.scheduler import remove_scheduler, scheduler_status, set
 from hackathon_searcher.settings import settings
 
 
+def _console_text(value: object) -> str:
+    """Keep validation output printable on legacy Windows consoles."""
+    text = str(value).replace("\u200b", "")
+    encoding = getattr(sys.stdout, "encoding", None)
+    if encoding:
+        return text.encode(encoding, errors="replace").decode(encoding)
+    return text
+
+
 def main() -> None:
     if len(sys.argv) < 2 or sys.argv[1].lower() in {"--help", "-h", "help"}:
         print("Hackathon Searcher — Multi-Applicant Edition")
@@ -50,7 +59,7 @@ def main() -> None:
         print("  daily       Discover and prepare opportunities (use --dry-run to force safe mode)")
         print("  profile     Show, validate, or improve an applicant profile")
         print("  team        Show or change the local team")
-        print("  llm         Check LLM configuration without an API call")
+        print("  llm         Check LLM configuration or show token/cost usage")
         print("  browser     Set up or verify the dedicated Chrome profile")
         print("  schedule    Set up, inspect, or remove the Windows daily task")
         print("  discover    Deeply inspect the ten priority application flows; no Submit")
@@ -85,8 +94,18 @@ def main() -> None:
 
     elif cmd == "llm":
         action = sys.argv[2].lower() if len(sys.argv) > 2 else "verify"
+        if action == "usage":
+            init_db()
+            usage = get_llm_usage_summary()
+            print(f"Requests: {usage.get('requests', 0)}")
+            print(f"Input tokens: {usage.get('input_tokens', 0)}")
+            print(f"Output tokens: {usage.get('output_tokens', 0)}")
+            print(f"Total tokens: {usage.get('total_tokens', 0)}")
+            print(f"Estimated cost (USD): {usage.get('estimated_cost_usd', 0.0):.6f}")
+            print(f"Unpriced requests: {usage.get('unpriced_requests', 0)}")
+            return
         if action != "verify":
-            print("Usage: llm verify")
+            print("Usage: llm verify | llm usage")
             return
         result = llm_configuration_status()
         print(f"Provider: {result['provider']}")
@@ -310,7 +329,7 @@ def main() -> None:
             answers = report.get('answers', [])
             for index, question in enumerate(report.get('questions', [])):
                 answer = answers[index].get('answer', '') if index < len(answers) else 'N/A — eligibility gate prevented answer generation'
-                print(f"    Q: {question.get('label', '')}\n    A: {answer}")
+                print(f"    Q: {_console_text(question.get('label', ''))}\n    A: {_console_text(answer)}")
             if report.get('blocker'):
                 print(f"  BLOCKER: {report['blocker']}")
 

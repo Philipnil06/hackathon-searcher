@@ -110,6 +110,16 @@ python -m hackathon_searcher.cli llm verify
 
 This validates the configuration without sending a paid API request or exposing the key.
 
+Successful provider responses now persist reported input/output/total token usage
+and an estimated USD cost in the local SQLite database. View the aggregate with:
+
+```bash
+python -m hackathon_searcher.cli llm usage
+```
+
+Known model rates are used when available; set `LLM_INPUT_COST_PER_1M_USD` and
+`LLM_OUTPUT_COST_PER_1M_USD` in `.env` for a custom provider/model.
+
 ## Browser and Luma setup
 
 Luma may use browser verification or CAPTCHA. Hackathon Searcher does not bypass either.
@@ -123,7 +133,7 @@ python -m hackathon_searcher.cli human-assist
 python -m hackathon_searcher.cli human-assist open <event_id>
 ```
 
-`browser setup` opens Chrome's extensions page and the extension folder. Enable Developer mode, choose **Load unpacked**, and select `chrome_extension`. This is a one-time manual Chrome step. `human-assist open` opens separately bound tabs per team member; the extension exposes only the prepared application for that tab. Review unmatched fields and click Luma's final submit button yourself. If `LUMA_SESSION_PRESENT` appears, log out in the dedicated profile before continuing.
+`browser setup` opens Chrome's extensions page and the extension folder. Enable Developer mode, choose **Load unpacked**, and select `chrome_extension`. This is a one-time manual Chrome step in the persistent dedicated profile. `human-assist open` reuses that profile and opens separately bound tabs per team member; keep the extension loaded there. Review unmatched fields and click Luma's final submit button yourself. After that manual click, the extension records the application only when Luma's screen changes or shows a confirmation; confirmed applications are excluded from future duplicate attempts.
 
 After confirming manual submissions, record them explicitly:
 
@@ -144,6 +154,8 @@ python -m hackathon_searcher.cli schedule remove --yes
 ```
 
 `schedule setup` creates or updates one task named **Hackathon Searcher Daily**. It runs daily at 09:00 local time, starts after a missed run when Windows becomes available, and ignores a new instance while an earlier one is active. It respects your local `DRY_RUN` setting. Scheduling is currently implemented for Windows only.
+
+Each unattended run writes a local activity timeline to `logs/activity-YYYY-MM-DD.jsonl` and its latest state to `logs/current_run.json`. The timeline records stage start/end, elapsed and CPU time, research progress, errors, and the final summary—but never profile answers or page contents. By default the scheduled task has a 25-minute budget and researches at most 5 expensive Stage 2 events; set `DAILY_MAX_RUNTIME_MINUTES` or `DAILY_STAGE2_CAP` in `.env` only for a deliberately broader run.
 
 ## Safety and dry-run mode
 
@@ -180,6 +192,7 @@ daily --dry-run               Discovery/research with submission forced off
 profile show|validate|improve  Manage applicant profiles
 team show|add|remove           Manage a 1-4 person team
 llm verify                    Check provider settings without an API request
+llm usage                     Show recorded tokens and estimated cost
 browser setup|verify|open      Manage the isolated Chrome profile
 schedule setup|status|remove   Manage the Windows background task
 human-assist                  List/open/confirm prepared Luma applications

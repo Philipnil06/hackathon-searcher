@@ -52,6 +52,8 @@ class Settings:
     # --- Discovery ---
     HACKATHON_HUB_URL: str = os.getenv("HACKATHON_HUB_URL", "https://hackathonhub.eu/")
     CRAWL_INTERVAL_HOURS: int = int(os.getenv("CRAWL_INTERVAL_HOURS", "24"))
+    DAILY_STAGE2_CAP: int = int(os.getenv("DAILY_STAGE2_CAP", "5"))
+    DAILY_MAX_RUNTIME_MINUTES: int = int(os.getenv("DAILY_MAX_RUNTIME_MINUTES", "25"))
 
     # --- Geography ---
     # Legacy global values; runtime location preferences are profile-specific.
@@ -77,6 +79,13 @@ class Settings:
     LLM_API_KEY: str = os.getenv("LLM_API_KEY", "")
     LLM_BASE_URL: str = os.getenv("LLM_BASE_URL", "")
 
+    # --- Luma extension auto-submit ---
+    # When DRY_RUN=false AND this is true, the Chrome extension may click the
+    # final Luma submit button after filling and report the confirmation back
+    # to the local bridge, which records the application as APPLIED.
+    LUMA_AUTO_SUBMIT: bool = os.getenv("LUMA_AUTO_SUBMIT", "false").lower() == "true"
+    LUMA_CONFIRMATION_TIMEOUT_MS: int = int(os.getenv("LUMA_CONFIRMATION_TIMEOUT_MS", "9000"))
+
     # --- Notification ---
     NOTIFY_HIGH_SCORE_THRESHOLD: int = int(os.getenv("NOTIFY_HIGH_SCORE_THRESHOLD", "80"))
     NOTIFY_ON_APPLICATION: bool = os.getenv("NOTIFY_ON_APPLICATION", "true").lower() == "true"
@@ -93,6 +102,11 @@ class Settings:
     @property
     def should_auto_apply(self) -> bool:
         return self.AUTO_APPLY and not self.DRY_RUN
+
+    @property
+    def should_auto_submit_luma(self) -> bool:
+        """Only allow the extension to click Luma's final submit in live mode."""
+        return self.LUMA_AUTO_SUBMIT and not self.DRY_RUN
 
 
 settings = Settings()

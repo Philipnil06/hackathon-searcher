@@ -185,6 +185,22 @@ CREATE TABLE IF NOT EXISTS daily_run_state (
     report_path TEXT DEFAULT ''
 );
 
+CREATE TABLE IF NOT EXISTS llm_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    operation TEXT DEFAULT '',
+    status TEXT DEFAULT 'success',
+    input_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    total_tokens INTEGER DEFAULT 0,
+    input_cost_per_1m_usd REAL,
+    output_cost_per_1m_usd REAL,
+    estimated_cost_usd REAL,
+    error TEXT DEFAULT ''
+);
+
 CREATE INDEX IF NOT EXISTS idx_events_status ON events(status);
 CREATE INDEX IF NOT EXISTS idx_events_score ON events(event_score);
 CREATE INDEX IF NOT EXISTS idx_events_country ON events(country);
@@ -676,6 +692,58 @@ def get_audit_log(event_id: Optional[str] = None, applicant_id: Optional[str] = 
                 (limit,)
             ).fetchall()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+# --- LLM usage ---
+
+def record_llm_usage(usage: dict) -> None:
+    """Persist provider-reported token usage and the local cost estimate."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            """INSERT INTO llm_usage (
+                timestamp, provider, model, operation, status,
+                input_tokens, output_tokens, total_tokens,
+                input_cost_per_1m_usd, output_cost_per_1m_usd,
+                estimated_cost_usd, error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                usage.get("timestamp", datetime.now(timezone.utc).isoformat()),
+                usage.get("provider", ""), usage.get("model", ""),
+                usage.get("operation", ""), usage.get("status", "success"),
+                int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0),
+                int(usage.get("total_tokens") or 0),
+                usage.get("input_cost_per_1m_usd"), usage.get("output_cost_per_1m_usd"),
+                usage.get("estimated_cost_usd"), usage.get("error", ""),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_llm_usage_summary() -> dict:
+    """Return aggregate LLM request/token/cost data for the local database."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            """SELECT COUNT(*) AS requests,
+                      COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                      COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                      COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                      COALESCE(SUM(estimated_cost_usd), 0.0) AS estimated_cost_usd,
+                      SUM(CASE WHEN estimated_cost_usd IS NULL THEN 1 ELSE 0 END) AS unpriced_requests
+                 FROM llm_usage"""
+        ).fetchone()
+        latest = conn.execute(
+            "SELECT timestamp, provider, model FROM llm_usage ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        result = dict(row) if row else {}
+        result["unpriced_requests"] = int(result.get("unpriced_requests") or 0)
+        result["latest"] = dict(latest) if latest else {}
+        return result
     finally:
         conn.close()
 

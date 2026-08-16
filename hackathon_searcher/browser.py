@@ -114,8 +114,35 @@ class BrowserSession:
                 self.page.fill(selector, field.answer)
                 return True
             elif field.field_type == "dropdown":
-                self.page.select_option(selector, label=field.answer)
-                return True
+                try:
+                    self.page.select_option(selector, label=field.answer)
+                    return True
+                except Exception:
+                    # Luma uses a text input + floating menu rather than a
+                    # native <select>. Prefer an exact option; when the saved
+                    # source is not offered, select the explicit "Other"
+                    # option instead of typing an invalid value.
+                    self.page.click(selector)
+                    options = self.page.locator('[role="tooltip"] .lux-menu-item, [role="option"], .lux-menu-item')
+                    option_count = options.count()
+                    normalized_answer = (field.answer or "").strip().lower()
+                    chosen = None
+                    for index in range(option_count):
+                        option = options.nth(index)
+                        text = option.inner_text().strip()
+                        if text.lower() == normalized_answer or normalized_answer in text.lower():
+                            chosen = option
+                            break
+                    if chosen is None and normalized_answer and "hackathonhub" in normalized_answer:
+                        for index in range(option_count):
+                            option = options.nth(index)
+                            if option.inner_text().strip().lower() == "other":
+                                chosen = option
+                                break
+                    if chosen is None:
+                        return False
+                    chosen.click()
+                    return True
             elif field.field_type == "radio":
                 try:
                     self.page.click(f"label:has-text('{field.answer}')")
@@ -132,7 +159,16 @@ class BrowserSession:
                 if checkbox:
                     should_check = field.answer.lower() in ("yes", "true", "1")
                     if should_check and not checkbox.is_checked():
-                        checkbox.check()
+                        try:
+                            checkbox.check()
+                        except Exception:
+                            # Luma's visible checkbox icon can intercept the
+                            # native input; click its associated label/icon.
+                            label = self.page.locator("label").filter(has=self.page.locator(selector))
+                            if label.count():
+                                label.first.click()
+                            else:
+                                self.page.locator(".checkbox-display").first.click()
                     elif not should_check and checkbox.is_checked():
                         checkbox.uncheck()
                 return True
@@ -172,15 +208,23 @@ class BrowserSession:
             const r=e.getBoundingClientRect();
             const candidates=texts.filter(t=>t.b<=r.y+10 && r.y-t.b<180 && Math.abs(t.x-r.x)<700)
               .sort((a,b)=>(r.y-a.b)-(r.y-b.b));
-            const nearby=candidates[0]?.t||'';
-            const id=e.id, name=e.name;
-            return {label: nearby, name, id, type:e.type||e.tagName.toLowerCase(), required:e.required||e.getAttribute('aria-required')==='true', placeholder:e.placeholder||'', selector:id?`#${CSS.escape(id)}`:(name?`[name="${CSS.escape(name)}"]`:''), order:i};
+            // Luma puts textarea questions in a nearby .inner-wrapper instead
+            // of a label[for] element. Prefer that local wrapper so a blank
+            // name/placeholder does not leave the question unreadable.
+            const local=e.closest('label, .inner-wrapper, .lux-input-wrapper, fieldset');
+            const nearby=(local?.innerText||candidates[0]?.t||'').trim();
+            const id=e.id, name=e.name, tag=e.tagName.toLowerCase();
+            const fallbackSelector=e.type==='checkbox' ? 'input[type="checkbox"]' : `[data-hackathon-searcher-field="${i}"]`;
+            if (!id && !name && e.type !== 'checkbox') e.setAttribute('data-hackathon-searcher-field', String(i));
+            return {label: nearby, name, id, type:e.type||tag, required:e.required||e.getAttribute('aria-required')==='true', placeholder:e.placeholder||'', selector:id?`#${CSS.escape(id)}`:(name?`[name="${CSS.escape(name)}"]`:fallbackSelector), order:i};
           });
         }""")
         result=[]
         for row in rows:
-            ftype={"email":"email","textarea":"textarea","checkbox":"checkbox","radio":"radio","tel":"phone"}.get(row["type"],"dropdown" if row["placeholder"]=="Select an option" else "text")
-            result.append(FormField(label=row["label"][:300], name=row["name"], field_type=ftype, required=bool(row["required"]), placeholder=row["placeholder"], order=row["order"], selector=row["selector"], description=row["label"][:500]))
+            placeholder = str(row.get("placeholder") or "").strip().lower()
+            ftype={"email":"email","textarea":"textarea","checkbox":"checkbox","radio":"radio","tel":"phone"}.get(row["type"],"dropdown" if placeholder in {"select an option", "välj ett alternativ"} else "text")
+            label = row["label"][:300]
+            result.append(FormField(label=label, name=row["name"], field_type=ftype, required=bool(row["required"] or "*" in label), placeholder=row["placeholder"], order=row["order"], selector=row["selector"], description=row["label"][:500]))
         return result
 
     def click_button(self, text: str) -> bool:

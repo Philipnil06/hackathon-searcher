@@ -328,6 +328,17 @@ class LiveCycleIntegrationTests(unittest.TestCase):
         field = live_submit.FormField(label="Select your professional role", field_type="dropdown", required=True, options=["Engineer", "Student"])
         self.assertEqual(generate_answer_for_field(field, profile, use_llm=False), "UNKNOWN_REQUIRED_FIELD")
 
+    def test_custom_dropdown_without_options_never_gets_prose_answer(self):
+        from hackathon_searcher.forms import generate_answer_for_field
+        profile = SimpleNamespace(email="applicant@example.com", match_answer=lambda *_: None)
+        field = live_submit.FormField(
+            label="What is your current role? *", field_type="text",
+            placeholder="Välj ett alternativ", required=False,
+        )
+        with patch("hackathon_searcher.forms.generate_application_answer") as generate:
+            self.assertEqual(generate_answer_for_field(field, profile), "UNKNOWN_REQUIRED_FIELD")
+            generate.assert_not_called()
+
     def test_cli_import_does_not_replace_standard_output(self):
         """CLI commands must keep a usable stdout stream for preflight reporting."""
         import sys

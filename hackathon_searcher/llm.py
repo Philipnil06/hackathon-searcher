@@ -18,7 +18,9 @@ With exponential backoff retry and structured output support.
 """
 
 import json
+import os
 import time
+from datetime import datetime, timezone
 from typing import Optional, Type, TypeVar
 
 import httpx
@@ -34,6 +36,66 @@ SUPPORTED_PROVIDERS = ("openai", "anthropic", "gemini", "mistral", "openai_compa
 MAX_RETRIES = 3
 BASE_DELAY = 1.0  # seconds
 MAX_DELAY = 30.0  # seconds
+
+# Prices are USD per 1M tokens. Unknown/custom models remain explicitly
+# unpriced unless the operator supplies LLM_*_COST_PER_1M_USD in .env.
+MODEL_PRICING_USD_PER_1M = {
+    "gpt-4o-mini": (0.15, 0.60),
+    "gpt-4o": (2.50, 10.00),
+}
+
+
+def _pricing(model: str) -> tuple[Optional[float], Optional[float]]:
+    input_override = os.getenv("LLM_INPUT_COST_PER_1M_USD", "").strip()
+    output_override = os.getenv("LLM_OUTPUT_COST_PER_1M_USD", "").strip()
+    try:
+        if input_override or output_override:
+            return (float(input_override) if input_override else None,
+                    float(output_override) if output_override else None)
+    except ValueError:
+        pass
+    normalized = model.lower().strip()
+    for model_prefix, rates in MODEL_PRICING_USD_PER_1M.items():
+        if normalized == model_prefix or normalized.startswith(model_prefix + "-"):
+            return rates
+    return None, None
+
+
+def _usage_value(usage: dict, *keys: str) -> int:
+    for key in keys:
+        value = usage.get(key)
+        if value is not None:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
+def _record_usage(model: str, operation: str, usage: Optional[dict] = None,
+                  status: str = "success", error: str = "") -> None:
+    """Persist usage without ever allowing telemetry to break an LLM call."""
+    usage = usage or {}
+    input_tokens = _usage_value(usage, "prompt_tokens", "input_tokens", "promptTokenCount")
+    output_tokens = _usage_value(usage, "completion_tokens", "output_tokens", "candidatesTokenCount")
+    total_tokens = _usage_value(usage, "total_tokens", "totalTokenCount") or input_tokens + output_tokens
+    input_rate, output_rate = _pricing(model)
+    estimated_cost = None
+    if input_rate is not None and output_rate is not None:
+        estimated_cost = (input_tokens * input_rate + output_tokens * output_rate) / 1_000_000
+    payload = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "provider": settings.LLM_PROVIDER, "model": model, "operation": operation,
+        "status": status, "input_tokens": input_tokens, "output_tokens": output_tokens,
+        "total_tokens": total_tokens, "input_cost_per_1m_usd": input_rate,
+        "output_cost_per_1m_usd": output_rate, "estimated_cost_usd": estimated_cost,
+        "error": error[:500],
+    }
+    try:
+        from hackathon_searcher.database import record_llm_usage
+        record_llm_usage(payload)
+    except Exception as exc:
+        print(f"[llm] Usage tracking failed: {str(exc)[:160]}")
 
 
 def _provider_key() -> str:
@@ -74,7 +136,7 @@ def llm_configuration_status() -> dict[str, str | bool]:
             "message": "LLM configuration is present. No API request was made."}
 
 
-def _chat_completion(prompt: str, system_prompt: str, model: str, temperature: float, max_tokens: int) -> str:
+def _chat_completion(prompt: str, system_prompt: str, model: str, temperature: float, max_tokens: int, operation: str = "completion") -> str:
     """Provider adapter returning plain text from a common request shape."""
     provider, key = settings.LLM_PROVIDER, _provider_key()
     if provider in {"openai", "mistral", "openai_compatible"}:
@@ -88,13 +150,17 @@ def _chat_completion(prompt: str, system_prompt: str, model: str, temperature: f
             "temperature": temperature, "max_tokens": max_tokens,
         }, timeout=60)
         response.raise_for_status()
-        return str(response.json()["choices"][0]["message"]["content"])
+        payload = response.json()
+        _record_usage(model, operation, payload.get("usage"))
+        return str(payload["choices"][0]["message"]["content"])
     if provider == "anthropic":
         response = httpx.post("https://api.anthropic.com/v1/messages", headers={"x-api-key": key, "anthropic-version": "2023-06-01"}, json={
             "model": model, "max_tokens": max_tokens, "system": system_prompt, "messages": [{"role": "user", "content": prompt}],
         }, timeout=60)
         response.raise_for_status()
-        return "".join(block.get("text", "") for block in response.json().get("content", []) if block.get("type") == "text")
+        payload = response.json()
+        _record_usage(model, operation, payload.get("usage"))
+        return "".join(block.get("text", "") for block in payload.get("content", []) if block.get("type") == "text")
     if provider == "gemini":
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
         body = {"contents": [{"role": "user", "parts": [{"text": prompt}]}]}
@@ -102,7 +168,9 @@ def _chat_completion(prompt: str, system_prompt: str, model: str, temperature: f
             body["systemInstruction"] = {"parts": [{"text": system_prompt}]}
         response = httpx.post(url, json=body, timeout=60)
         response.raise_for_status()
-        return str(response.json()["candidates"][0]["content"]["parts"][0]["text"])
+        payload = response.json()
+        _record_usage(model, operation, payload.get("usageMetadata"))
+        return str(payload["candidates"][0]["content"]["parts"][0]["text"])
     raise ValueError(f"Unsupported LLM provider: {provider}")
 
 
@@ -141,10 +209,11 @@ def complete(
 
     try:
         def _call():
-            return _chat_completion(prompt, system_prompt, model, temperature, max_tokens)
+            return _chat_completion(prompt, system_prompt, model, temperature, max_tokens, operation="completion")
 
         return _retry_with_backoff(_call)
     except Exception as e:
+        _record_usage(model, "completion", status="error", error=str(e))
         print(f"[llm] Completion failed: {e}")
         return None
 
@@ -167,7 +236,7 @@ def complete_structured(
 
     try:
         def _call():
-            result_text = _chat_completion(full_prompt, system_prompt, model, temperature, 4000)
+            result_text = _chat_completion(full_prompt, system_prompt, model, temperature, 4000, operation="structured_completion")
             if result_text:
                 if result_text.startswith("```"):
                     lines = result_text.split("\n")
@@ -177,6 +246,7 @@ def complete_structured(
 
         return _retry_with_backoff(_call)
     except Exception as e:
+        _record_usage(model, "structured_completion", status="error", error=str(e))
         print(f"[llm] Structured completion failed: {e}")
         return None
 
@@ -233,8 +303,8 @@ def generate_application_answer(
     library_json = json.dumps(answer_library, indent=2)
 
     word_guidance = ""
-    if word_limit:
-        word_guidance = f"\nKeep your answer under {word_limit} words."
+    effective_word_limit = word_limit or 60
+    word_guidance = f"\nKeep your answer under {effective_word_limit} words."
 
     prompt = f"""Write an application answer for a hackathon application.
 
@@ -254,17 +324,17 @@ RULES:
 1. Only use facts that are EXPLICITLY in the applicant profile above.
 2. Never invent education, employment, awards, projects, or skills.
 3. Tailor the answer to THIS specific hackathon - mention relevant themes, sponsors, or focus areas from the event context.
-4. Write like an ambitious young builder, not corporate AI. Use specific stories, numbers, concrete projects. Short paragraphs. Direct language.
+    4. Write like an ambitious young builder, not corporate AI. Use one concrete topic or project, one short paragraph, and direct language.
 5. Avoid: "I'm deeply passionate about...", "at the intersection of...", em dashes, generic enthusiasm, repeating event marketing copy.
-6. For short text fields: 1-2 concise sentences.
-7. For motivation questions: approximately 80-180 words.
-8. If the question asks for something not in the profile, say so rather than inventing.
+    6. Keep every answer concise: 1-2 sentences and under 60 words unless a lower limit is supplied.
+    7. Answer only what the question asks. Do not add background, generic enthusiasm, event-summary text, or a second topic.
+    8. If the question asks for something not in the profile, say so rather than inventing.
 
 Answer:"""
 
     system = "You are an AI that writes personalized hackathon applications. You only use verified facts from the provided profile. You write like a smart, ambitious young builder - specific, direct, genuine."
 
-    result = complete(prompt, system_prompt=system, temperature=0.8, max_tokens=1000)
+    result = complete(prompt, system_prompt=system, temperature=0.5, max_tokens=400)
     return result.strip() if result else ""
 
 

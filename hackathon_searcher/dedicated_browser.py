@@ -119,9 +119,6 @@ def launch_dedicated_chrome(urls: list[str]) -> subprocess.Popen:
     args = [str(chrome), f"--user-data-dir={profile}", "--profile-directory=Default", "--no-first-run", "--no-default-browser-check", "--new-window"]
     if not EXTENSION_DIR.is_dir():
         raise RuntimeError("The local Chrome extension directory is missing. Reinstall the repository files.")
-    # The extension is deliberately not force-loaded or installed here. The
-    # user performs Chrome's normal Load unpacked step once in this dedicated
-    # profile, after which Chrome persists it normally.
     args.extend(urls)
     return subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 

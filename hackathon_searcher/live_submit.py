@@ -78,7 +78,7 @@ UNCERTAIN_SUBMISSION_STATUSES = {"SUBMISSION_STATUS_UNKNOWN", "SUBMITTED_CONFIRM
 def _team_blocked_status(applications: dict[str, dict]) -> str:
     """Map a failing individual hard gate to the event-level team state."""
     statuses = " ".join(str(app.get("status", "")) for app in applications.values())
-    if any(str(app.get("status", "")) in {"APPLIED", *UNCERTAIN_SUBMISSION_STATUSES} for app in applications.values()):
+    if any(str(app.get("status", "")) in {"APPLIED", "MANUALLY_SUBMITTED", *UNCERTAIN_SUBMISSION_STATUSES} for app in applications.values()):
         return "TEAM_ALREADY_APPLIED"
     if "ELIGIB" in statuses or "INELIGIBLE" in statuses:
         return "TEAM_BLOCKED_ELIGIBILITY"
@@ -177,14 +177,26 @@ def _has_json_content(value: Any) -> bool:
 
 
 def _cross_profile_issues(applicant_id: str, answers: list[dict]) -> list[str]:
+    current = profile_manager.get(applicant_id)
     forbidden: list[str] = []
     for other in profile_manager.all_profiles:
-        if other.applicant_id == applicant_id:
+        # Team configs created before profile IDs were made explicit use short
+        # member names ("michelle"/"philip"), while profile files may expose
+        # suffixed IDs ("michelle_zhang"/"philip_nilsson"). Skip the current
+        # profile by object identity/facts as well as by ID so its own email is
+        # not reported as cross-profile contamination.
+        if other is current or other.applicant_id == applicant_id:
             continue
         forbidden.extend(value.lower() for value in (other.full_name, other.email) if value)
     issues = []
     for item in answers:
+        label = str(item.get("label", "")).lower()
         answer = str(item.get("answer", ""))
+        # A team registration question is expected to name the other verified
+        # applicant. Do not treat that required team identity as leakage from
+        # another profile; all other fields remain subject to this gate.
+        if any(term in label for term in ("team", "teammate", "teamkamrat")):
+            continue
         for word in forbidden:
             if word in answer.lower():
                 issues.append(f"Cross-profile contamination: {word}")
@@ -592,6 +604,13 @@ def prepare_ready_to_apply(preflight: bool = False, event_ids: set[str] | None =
         if event_ids is not None and event.get("event_id") not in event_ids:
             continue
         event_score = _safe_float(event.get("event_score"))
+        # The live minimum is a real gate, not just a final queue preference.
+        # Applying it before browser discovery prevents daily runs from opening
+        # hundreds of low-value/old event pages and wasting CPU and network.
+        if event_score < settings.LIVE_MIN_EVENT_SCORE:
+            log_audit(event["event_id"], "SKIPPED_EVENT_SCORE",
+                      f"event_score={event_score:.1f} below live minimum {settings.LIVE_MIN_EVENT_SCORE}")
+            continue
         hub, official, final_travel = _finalize_travel_status(event)
         update_event(event["event_id"], {
             "hub_travel_status": hub,
@@ -603,7 +622,7 @@ def prepare_ready_to_apply(preflight: bool = False, event_ids: set[str] | None =
             if not profile:
                 continue
             existing = get_application(event["event_id"], applicant_id)
-            if existing and existing.get("status") in {"APPLIED", *UNCERTAIN_SUBMISSION_STATUSES}:
+            if existing and existing.get("status") in {"APPLIED", "MANUALLY_SUBMITTED", *UNCERTAIN_SUBMISSION_STATUSES}:
                 continue
             reuse_cached_fit = False  # Apply-score recalculation must use current scoring rules.
             if reuse_cached_fit and event_ids is not None and existing and existing.get("discovery_status"):
@@ -637,7 +656,7 @@ def prepare_ready_to_apply(preflight: bool = False, event_ids: set[str] | None =
                 "travel_requirement_status": fit.get("travel_requirement_status", ""),
                 "accommodation_requirement_status": fit.get("accommodation_requirement_status", ""),
                 "travel_support_status": final_travel,
-                "duplicate_check_passed": 1 if not (existing and existing.get("status") in {"APPLIED", *UNCERTAIN_SUBMISSION_STATUSES}) else 0,
+                "duplicate_check_passed": 1 if not (existing and existing.get("status") in {"APPLIED", "MANUALLY_SUBMITTED", *UNCERTAIN_SUBMISSION_STATUSES}) else 0,
             }
             if not existing:
                 insert_application({**base, "status": "QUALIFIED"})
@@ -956,13 +975,19 @@ def _open_luma_public_form(browser: BrowserSession, event_url: str) -> tuple[lis
         fields = extract_form_fields(html, browser.page.url or event_url)
         rendered = browser.get_rendered_form_fields()
         for index, field in enumerate(fields):
-            if index >= len(rendered) or field.label:
+            if index >= len(rendered):
                 continue
-            candidate = rendered[index].label.strip()
-            if re.match(r"(?:what|how|are|do|can|is|i agree|i confirm)|.*\?", candidate, re.IGNORECASE):
+            rendered_field = rendered[index]
+            if rendered_field.field_type == "dropdown":
+                field.field_type = "dropdown"
+            if field.selector == "":
+                field.selector = rendered_field.selector
+            if field.label:
+                continue
+            candidate = rendered_field.label.strip()
+            if len(candidate) > 3 and candidate.lower() not in {"your name", "you@email.com", "select an option"}:
                 field.label = candidate
                 field.description = candidate
-                field.selector = rendered[index].selector
         if not fields:
             fields = rendered
         if fields:
@@ -1214,7 +1239,7 @@ def validate_live_eligibility(event_id: str, applicant_id: str) -> dict[str, Any
         if not passed:
             blockers.append(f"READY_TO_APPLY gate failed: {name}")
     checks["no_duplicate"] = not (
-        existing and existing.get("status") in ("APPLIED", *UNCERTAIN_SUBMISSION_STATUSES)
+        existing and existing.get("status") in ("APPLIED", "MANUALLY_SUBMITTED", *UNCERTAIN_SUBMISSION_STATUSES)
     )
     if not checks["no_duplicate"]:
         blockers.append("Already applied")

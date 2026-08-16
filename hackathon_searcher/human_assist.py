@@ -73,7 +73,7 @@ def _app_text(app: dict) -> str:
     lines.extend([
         "Consent selections are included above where required.",
         f"Special notes: {app.get('notes', '') or 'None'}",
-        "Manual submission must be confirmed with `human-assist mark-submitted <event_id>`; it is never inferred.",
+        "After you click Luma's final submit button, the extension records the application when Luma confirms or changes screen. Use `human-assist mark-submitted <event_id>` only as a fallback if that click cannot be verified.",
     ])
     return "\n".join(lines) + "\n"
 
@@ -136,7 +136,7 @@ def pending_human_assist_events() -> list[dict]:
     for app in get_all_applications():
         if app.get("form_provider", "").lower() == "luma":
             event = get_event_by_id(app["event_id"])
-            if event and (event.get("team_status") == HUMAN_ASSISTED_SUBMISSION_REQUIRED or event.get("team_apply_score", 0) >= 55):
+            if event and event.get("team_status") != "TEAM_APPLIED" and (event.get("team_status") == HUMAN_ASSISTED_SUBMISSION_REQUIRED or event.get("team_apply_score", 0) >= 55):
                 candidates[event["event_id"]] = event
     return list(candidates.values())
 

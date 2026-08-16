@@ -11,6 +11,8 @@ Features:
 
 import json
 import os
+import time
+from collections import Counter
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
@@ -41,6 +43,7 @@ from hackathon_searcher.scraper import discover_events, process_discovered_event
 from hackathon_searcher.settings import settings
 from hackathon_searcher.team import load_team
 from hackathon_searcher.travel import assess_accommodation, assess_location, assess_travel_support
+from hackathon_searcher.activity_log import StageTimer, log_activity
 
 # === CONSTANTS ===
 
@@ -630,6 +633,8 @@ def run_daily_pipeline(dry_run_override: Optional[bool] = None, live_preflight: 
 
     init_db()
     run_id = start_daily_run()
+    run_started = time.monotonic()
+    max_runtime_seconds = max(1, settings.DAILY_MAX_RUNTIME_MINUTES) * 60
     errors = []
     state = {
         "events_total": 0, "events_new": 0, "events_updated": 0,
@@ -637,7 +642,21 @@ def run_daily_pipeline(dry_run_override: Optional[bool] = None, live_preflight: 
         "travel_support_found": 0, "errors": [],
     }
 
+    def budget_exhausted(stage: str) -> bool:
+        if time.monotonic() - run_started <= max_runtime_seconds:
+            return False
+        message = f"Time budget reached before {stage}; remaining work deferred to the next run."
+        errors.append(message)
+        log_activity("runtime_budget_exhausted", run_id=run_id, stage=stage,
+                     max_runtime_minutes=settings.DAILY_MAX_RUNTIME_MINUTES)
+        print(f"  {message}")
+        return True
+
     try:
+        log_activity("daily_run_started", run_id=run_id, dry_run=settings.DRY_RUN,
+                     live_test_mode=settings.LIVE_TEST_MODE,
+                     max_runtime_minutes=settings.DAILY_MAX_RUNTIME_MINUTES,
+                     stage2_cap=settings.DAILY_STAGE2_CAP)
         print("=" * 60)
         print(f"DAILY HACKATHON SEARCH — {stockholm_str()}")
         print(f"DRY_RUN: {settings.DRY_RUN}")
@@ -645,69 +664,116 @@ def run_daily_pipeline(dry_run_override: Optional[bool] = None, live_preflight: 
 
         # === 1. Discover ===
         print("\n[1/6] DISCOVERING EVENTS...")
-        raw_events = discover_events()
+        with StageTimer("discovery", run_id=run_id) as timer:
+            raw_events = discover_events()
+            timer.finish(events_discovered=len(raw_events))
         state["events_total"] = len(raw_events)
         print(f"  {len(raw_events)} events")
 
-        new_ids, updated_ids, skipped = process_discovered_events(raw_events)
+        with StageTimer("store_discovery", run_id=run_id) as timer:
+            new_ids, updated_ids, skipped = process_discovered_events(raw_events)
+            timer.finish(new_events=len(new_ids), updated_events=len(updated_ids), known_events=skipped)
         state["events_new"] = len(new_ids)
         state["events_updated"] = len(updated_ids)
         print(f"  New: {len(new_ids)}, Updated: {len(updated_ids)}, Skipped: {skipped}")
 
         # === 2. Stage 1 Filter + Rank ===
         print("\n[2/6] STAGE 1 FILTER + RANKING...")
+        stage1_started = time.monotonic()
+        log_activity("stage_started", run_id=run_id, stage="stage1_filter")
         candidates = get_events_needing_stage2_research()
         ranked = rank_events_for_research(candidates)
 
         # Log ALL rejections
+        rejected_by_reason: Counter[str] = Counter()
         for event in candidates:
             should, score, reason = stage1_score(event)
             if not should:
+                reason_key = reason.split(";", 1)[0] or "no_signal"
+                rejected_by_reason[reason_key] += 1
                 log_audit(event["event_id"], "SKIPPED_LOW_SCORE",
                           f"score={score}: {reason}")
+                log_activity("event_filter_skipped", run_id=run_id, event_id=event["event_id"],
+                             event_name=event.get("event_name", ""), score=score, reason=reason)
 
         # Split mandatory vs optional
         mandatory = [e for e in ranked if is_mandatory_research(e)]
         optional = [e for e in ranked if not is_mandatory_research(e)]
 
         # Adaptive cap: mandatory events always get researched
-        remaining_slots = max(0, STAGE2_CAP - len(mandatory))
+        remaining_slots = max(0, settings.DAILY_STAGE2_CAP - len(mandatory))
         to_research = mandatory + optional[:remaining_slots]
+
+        log_activity("stage_completed", run_id=run_id, stage="stage1_filter",
+                     elapsed_seconds=round(time.monotonic() - stage1_started, 2),
+                     candidates=len(candidates), ranked=len(ranked), mandatory=len(mandatory),
+                     selected_for_research=len(to_research),
+                     rejected_by_reason=dict(rejected_by_reason))
+        state["stage1_summary"] = {
+            "candidates": len(candidates), "ranked": len(ranked),
+            "selected": len(to_research), "rejected_by_reason": dict(rejected_by_reason),
+        }
+        for event in to_research:
+            log_activity("event_filter_selected", run_id=run_id, event_id=event["event_id"],
+                         event_name=event.get("event_name", ""))
 
         print(f"  Candidates: {len(candidates)}, Mandatory: {len(mandatory)}, "
               f"Optional slots: {remaining_slots}, Total to research: {len(to_research)}")
 
         # === 3. Stage 2 Research ===
         print("\n[3/6] STAGE 2 RESEARCH...")
+        stage2_started = time.monotonic()
+        log_activity("stage_started", run_id=run_id, stage="stage2_research", selected=len(to_research))
         researched = 0
         for event in to_research:
+            if budget_exhausted("stage2_research"):
+                break
+            log_activity("event_research_started", run_id=run_id, event_id=event["event_id"],
+                         event_name=event.get("event_name", ""))
             try:
                 findings = stage2_research_event(event["event_id"])
                 if findings:
                     researched += 1
                     if "CONFIRMED" in findings.get("travel_support", ""):
                         state["travel_support_found"] += 1
+                log_activity("event_research_completed", run_id=run_id, event_id=event["event_id"],
+                             findings=list((findings or {}).keys()))
             except Exception as e:
                 errors.append(f"Research failed for {event.get('event_id')}: {e}")
+                log_activity("event_research_failed", run_id=run_id, event_id=event["event_id"], error=str(e))
         state["events_researched"] = researched
+        log_activity("stage_completed", run_id=run_id, stage="stage2_research",
+                     elapsed_seconds=round(time.monotonic() - stage2_started, 2), researched=researched,
+                     travel_support_found=state["travel_support_found"])
         print(f"  Researched: {researched}, Travel support found: {state['travel_support_found']}")
 
         # === 4. Score ===
         print("\n[4/6] SCORING...")
+        scoring_started = time.monotonic()
+        log_activity("stage_started", run_id=run_id, stage="scoring")
         from hackathon_searcher.database import get_events_needing_research
         to_score = get_events_needing_research()
+        scored = 0
         for event in to_score[:50]:  # Cap scoring too
+            if budget_exhausted("scoring"):
+                break
             try:
                 score_event(event["event_id"])
                 for aid in profile_manager.applicant_ids:
                     score_applicant_fit(event["event_id"], aid)
+                scored += 1
             except Exception as e:
                 errors.append(f"Scoring failed: {e}")
+        log_activity("stage_completed", run_id=run_id, stage="scoring",
+                     elapsed_seconds=round(time.monotonic() - scoring_started, 2),
+                     candidates=len(to_score), scored=scored)
 
         # === 5. Applications ===
         print("\n[5/6] PREPARING APPLICATIONS...")
 
-        if settings.LIVE_TEST_MODE and (not settings.DRY_RUN or live_preflight):
+        if budget_exhausted("application_preparation"):
+            state["applications_deferred"] = True
+        elif settings.LIVE_TEST_MODE and (not settings.DRY_RUN or live_preflight):
             # CONTROLLED LIVE MODE
             if live_preflight:
                 print("  PREFLIGHT MODE ACTIVE — submissions disabled")
@@ -729,7 +795,7 @@ def run_daily_pipeline(dry_run_override: Optional[bool] = None, live_preflight: 
             state["live_report"] = live_report
             if live_report.get("aborted"):
                 print("\n  ⚠️ LIVE RUN ABORTED — stopping further submissions")
-        else:
+        elif not state.get("applications_deferred"):
             # DRY RUN or full auto mode
             # Luma remains fully automated through validation and answer
             # preparation, then becomes a human-assisted package. This does
@@ -759,6 +825,10 @@ def run_daily_pipeline(dry_run_override: Optional[bool] = None, live_preflight: 
         state["errors"] = errors
 
         complete_daily_run(run_id, state)
+        log_activity("daily_run_completed", run_id=run_id,
+                     elapsed_seconds=round(time.monotonic() - run_started, 2),
+                     events_total=state["events_total"], events_researched=state["events_researched"],
+                     applications_blocked=state["applications_blocked"], errors=len(errors))
         print(f"\n{'='*60}")
         print("DAILY RUN COMPLETE")
         print(f"  New: {state['events_new']}, Researched: {state['events_researched']}")
@@ -773,6 +843,8 @@ def run_daily_pipeline(dry_run_override: Optional[bool] = None, live_preflight: 
         except Exception:
             pass
         print(f"\nDAILY RUN FAILED: {e}")
+        log_activity("daily_run_failed", run_id=run_id,
+                     elapsed_seconds=round(time.monotonic() - run_started, 2), error=str(e))
 
     finally:
         release_run_lock()
@@ -800,6 +872,19 @@ def _write_daily_report(state: dict) -> str:
         f"Blocked: {state.get('applications_blocked', 0)}",
         f"Travel support found: {state.get('travel_support_found', 0)}", "",
     ]
+    stage1 = state.get("stage1_summary", {})
+    if stage1:
+        lines.extend([
+            "WHY EVENTS WERE NOT RESEARCHED",
+            f"Stage 1 candidates: {stage1.get('candidates', 0)}",
+            f"Passed filter: {stage1.get('ranked', 0)}",
+            f"Selected for Stage 2: {stage1.get('selected', 0)}",
+        ])
+        rejected = stage1.get("rejected_by_reason", {})
+        if rejected:
+            lines.append("Filter rejections:")
+            lines.extend(f"- {reason}: {count}" for reason, count in sorted(rejected.items(), key=lambda item: (-item[1], item[0])))
+        lines.append("")
     path.write_text("\n".join(lines), encoding="utf-8")
     return str(path)
 

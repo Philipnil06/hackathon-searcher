@@ -34,6 +34,7 @@ FORM_PROVIDERS = {
 SENSITIVE_QUESTION_PATTERNS = [
     r"citizenship", r"visa\s*(status|type|required)", r"criminal",
     r"disability", r"medical", r"gender\s*identity", r"ethnicity",
+    r"lgbtq", r"sexual\s*orientation", r"identity\s+as",
     r"legal\s*declaration", r"financial\s*declaration", r"contractual",
     r"photo\s*consent", r"terms\s*(and|&)\s*conditions.*agree",
     r"parental\s*consent", r"marketing\s*consent", r"privacy\s*declaration",
@@ -94,6 +95,7 @@ def _parse_form_element(element, order: int) -> Optional[FormField]:
             label_text = label.get_text(strip=True)
     if not label_text:
         label_text = element.get("aria-label", "") or placeholder or name
+    required = required or "*" in label_text
 
     skip_types = {"hidden", "submit", "button", "reset", "image"}
     if field_type in skip_types:
@@ -207,6 +209,23 @@ def generate_answer_for_field(
             return url
         return ""
 
+    # Some providers expose profile links as ordinary text inputs. Resolve
+    # these semantics before generic name/LLM handling.
+    if any(term in question_lower for term in ("github", "linkedin", "portfolio", "personal website", "website")):
+        url = _match_url_field(question_lower, profile)
+        if url:
+            return url
+
+    if _is_team_question(question_lower):
+        library_answer = next((entry.get("answer", "") for entry in profile.answers if entry.get("id") == "team_or_individual"), "")
+        if library_answer:
+            return library_answer
+        partner = profile.default_partner.replace("_", " ").title()
+        return f"I'm applying together with {partner}." if partner else "UNKNOWN_REQUIRED_FIELD"
+
+    if _is_skills_question(question_lower):
+        return ", ".join(str(skill) for skill in profile.skills if skill)
+
     if _is_name_field(question_lower):
         # Check if they ask for full/legal name
         if "full" in question_lower or "legal" in question_lower:
@@ -247,7 +266,8 @@ def generate_answer_for_field(
         return match["answer"]
 
     # --- Dropdown / radio ---
-    if field.options and field.field_type in ("dropdown", "radio"):
+    is_custom_dropdown = field.field_type in ("dropdown", "radio") or str(field.placeholder or "").strip().lower() in {"select an option", "välj ett alternativ"}
+    if is_custom_dropdown and field.options:
         for opt in field.options:
             opt_lower = opt.lower().strip()
             if "sweden" in opt_lower or "stockholm" in opt_lower:
@@ -257,6 +277,12 @@ def generate_answer_for_field(
         # Selecting the first option would be a guess.  A required unknown
         # choice must block rather than silently selecting a value.
         return "UNKNOWN_REQUIRED_FIELD" if field.required else ""
+
+    # Custom dropdowns without an observed option list must never receive a
+    # prose LLM answer. The browser can only safely choose a value after the
+    # live menu exposes a matching option.
+    if is_custom_dropdown:
+        return "UNKNOWN_REQUIRED_FIELD" if field.required or "*" in question else ""
 
     if field.field_type in ("checkbox",) or _is_yes_no_field(question_lower):
         return "Yes"
@@ -286,6 +312,8 @@ def generate_answer_for_field(
 
 def _match_url_field(question_lower: str, profile: ApplicantProfile) -> str:
     if "github" in question_lower:
+        if "username" in question_lower:
+            return urlparse(profile.github).path.strip("/").split("/")[0] if profile.github else ""
         return profile.github
     if "linkedin" in question_lower:
         return profile.linkedin
@@ -297,8 +325,17 @@ def _match_url_field(question_lower: str, profile: ApplicantProfile) -> str:
 
 
 def _is_name_field(ql: str) -> bool:
-    patterns = ["name", "full name", "first name", "last name"]
-    return any(p in ql for p in patterns) and "hackathon" not in ql and "event" not in ql
+    if any(term in ql for term in ("username", "team", "teammate", "names of")):
+        return False
+    return bool(re.search(r"\b(?:full|first|last)?\s*name\b", ql)) and "hackathon" not in ql and "event" not in ql
+
+
+def _is_team_question(ql: str) -> bool:
+    return any(term in ql for term in ("team or", "coming with a team", "teammate", "applying as a team"))
+
+
+def _is_skills_question(ql: str) -> bool:
+    return "what are your skills" in ql or "your skills" in ql
 
 
 def _is_location_field(ql: str) -> bool:
